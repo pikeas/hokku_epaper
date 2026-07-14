@@ -810,7 +810,9 @@ static bool wifi_connect(void)
         wifi_config_t wifi_cfg = {
             .sta = {
                 .threshold.authmode = WIFI_AUTH_OPEN,
-                .pmf_cfg = { .capable = true, .required = false },
+                /* DIAGNOSTIC 1.2.8: PMF off — A/B for the 1.2.6 pmf_cfg change (intermittent
+                 * auth failures on TR/BL vs quiet 1.2.0 on wall-1). Not for upstream. */
+                .pmf_cfg = { .capable = false, .required = false },
             },
         };
         /* strncpy with n == sizeof(dst) leaves the last byte unwritten for a
