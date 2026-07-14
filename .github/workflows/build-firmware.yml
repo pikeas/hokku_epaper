@@ -1,0 +1,27 @@
+name: Build Firmware
+
+# Scratch workflow (skip-refresh-ci branch only): builds the merged firmware
+# bin via the same espressif/idf image as ci-build.sh expects. Not for upstream.
+on:
+  workflow_dispatch:
+  push:
+    branches: [skip-refresh-ci]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.3
+          target: esp32s3
+          path: firmware
+          command: bash ci-build.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hokku-firmware
+          path: firmware/release/hokku-firmware_*.bin
+          if-no-files-found: error
