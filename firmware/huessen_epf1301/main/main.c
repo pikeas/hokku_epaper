@@ -446,12 +446,17 @@ static void spi_init(void)
  * 20ms / 20ms / 200ms (no BUSY wait) sequence was the leading suspect
  * for why the display got stuck in half-rendered states that only
  * reflashing the original firmware reliably cleared. */
-static void epaper_reset(void)
+static void epaper_reset_pulse(void)
 {
     gpio_set_level(PIN_EPAPER_RST, 0);
     vTaskDelay(pdMS_TO_TICKS(100));
     gpio_set_level(PIN_EPAPER_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(100));
+}
+
+static void epaper_reset(void)
+{
+    epaper_reset_pulse();
     epaper_wait_busy();
 }
 
@@ -615,8 +620,11 @@ static void epaper_display_dual(const uint8_t *ctrl1_data, const uint8_t *ctrl2_
     /* Step 2: deselect both panels before touching anything else */
     ctrl_high();
 
-    /* Step 3: first hardware reset */
-    epaper_reset();
+    /* Step 3: first hardware reset — pulse only. The factory firmware does
+     * not BUSY-wait here (docs/reverse_engineering_v2.0.19_apr21.md); only
+     * the second reset after the settle waits. Waiting here turns a slow
+     * controller power-on into a 60 s BUSY timeout. */
+    epaper_reset_pulse();
 
     /* Step 4: let the DC-DC booster fully stabilise before the second
      * reset. Matches original firmware's 1000 ms wait inside display_init. */
