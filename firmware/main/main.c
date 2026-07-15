@@ -1760,16 +1760,19 @@ static void regime_battery_idle(int64_t boot_time_us)
      * perform_refresh always sets next_refresh_epoch to a future value
      * on this boot (either from the server's schedule or via
      * schedule_retry_in on failure). So the common case is a future
-     * next_refresh_epoch; the SLEEP_FALLBACK_3H_US branch only fires
-     * when we have no clock at all (never successfully synced from
-     * server). There is no "past-due + future-sleep" branch because
-     * it's unreachable under the retry-helper invariant. */
+     * next_refresh_epoch. Past-due is reachable: the deadline is set
+     * before the ~19 s paint, so a cycle can outlive a short cadence.
+     * The 3 h fallback is only for the no-clock case. */
     time_t now = now_epoch();
     int64_t sleep_us;
     if (next_refresh_epoch > 0 && now > 0 && next_refresh_epoch > now) {
         sleep_us = (int64_t)(next_refresh_epoch - now) * 1000000LL;
+    } else if (next_refresh_epoch > 0 && now > 0) {
+        /* past due: must stay positive — enter_deep_sleep arms the timer
+         * wake only when sleep_us > 0 */
+        sleep_us = (int64_t)REFRESH_RETRY_SECONDS * 1000000LL;
     } else {
-        /* No valid / future schedule: wake in 3 h and retry. */
+        /* No clock at all (never synced): wake in 3 h and retry. */
         sleep_us = SLEEP_FALLBACK_3H_US;
     }
     enter_deep_sleep(sleep_us);
@@ -1944,6 +1947,7 @@ void app_main(void)
                      "Run hokku-setup to\nreconfigure.",
                      CONFIG_VERSION, config.cfg_ver);
             display_message(msg);
+            next_refresh_epoch = 0;  /* invalid config invalidates the schedule */
             regime_battery_idle(boot_time);
             return;
         }
@@ -1955,6 +1959,7 @@ void app_main(void)
                 "hokku-setup to\n"
                 "configure."
             );
+            next_refresh_epoch = 0;  /* invalid config invalidates the schedule */
             regime_battery_idle(boot_time);
             return;
         }
