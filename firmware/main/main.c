@@ -96,7 +96,9 @@ static const char *TAG = "hokku";
 #define COLOR_WHITE_BYTE   0x11
 
 /* ── Network / timeouts ──────────────────────────────────────────── */
-#define WIFI_CONNECT_TIMEOUT_MS  8000   /* per-network attempt; two networks = 16 s worst case */
+#define WIFI_CONNECT_TIMEOUT_MS  8000   /* L2 association budget per attempt */
+#define WIFI_IP_TIMEOUT_MS      30000   /* total incl. DHCP: broadcast replies are lossy
+                                         * over RF and lwIP's retry tail runs ~22 s */
 #define HTTP_TIMEOUT_MS          30000
 
 /* ── Battery ─────────────────────────────────────────────────────── */
@@ -220,8 +222,9 @@ static void log_level_apply(bool usb_awake);
 /* ── Shared globals ──────────────────────────────────────────────── */
 static spi_device_handle_t spi_handle;
 static EventGroupHandle_t  wifi_events;
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1
+#define WIFI_CONNECTED_BIT BIT0   /* got IP */
+#define WIFI_FAIL_BIT      BIT1   /* any STA disconnect */
+#define WIFI_L2_BIT        BIT2   /* associated (L2 up, DHCP may still run) */
 
 /* Set by wifi_connect() on each successful connect: true iff the fast-
  * reconnect path (cached BSSID + channel) actually worked. False if we
@@ -727,7 +730,9 @@ static void epaper_display_dual(const uint8_t *ctrl1_data, const uint8_t *ctrl2_
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
 {
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
+        xEventGroupSetBits(wifi_events, WIFI_L2_BIT);
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupSetBits(wifi_events, WIFI_FAIL_BIT);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
@@ -768,6 +773,48 @@ static void wifi_init_once(void)
         return false;                                                   \
     }                                                                   \
 } while (0)
+
+/* L2 association and DHCP are separate failure domains: association is
+ * fast or fails fast; DHCP replies are 802.11 broadcasts that get lost
+ * over RF and retry for ~22 s. A slow DHCP must not tear down a healthy
+ * association — only a disconnect is terminal once L2 is up. */
+static bool wifi_wait_for_ip(void)
+{
+    int64_t start_us = esp_timer_get_time();
+    EventBits_t bits = xEventGroupWaitBits(wifi_events,
+        WIFI_CONNECTED_BIT | WIFI_L2_BIT | WIFI_FAIL_BIT,
+        pdFALSE, pdFALSE, pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
+    if (bits & WIFI_CONNECTED_BIT) return true;
+    if (bits & WIFI_FAIL_BIT) return false;        /* auth/assoc rejected or dropped */
+    if (!(bits & WIFI_L2_BIT)) {
+        ESP_LOGW(TAG, "No association within %d ms", WIFI_CONNECT_TIMEOUT_MS);
+        return false;
+    }
+
+    /* DHCP gets the remainder of the budget from attempt start; a fixed
+     * post-association wait would let the retry tail race the deadline */
+    int64_t remaining_ms = WIFI_IP_TIMEOUT_MS - (esp_timer_get_time() - start_us) / 1000;
+    if (remaining_ms < 1000) remaining_ms = 1000;
+    ESP_LOGI(TAG, "L2 up, waiting for IP (DHCP, %lld ms budget)...", (long long)remaining_ms);
+    bits = xEventGroupWaitBits(wifi_events,
+        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+        pdFALSE, pdFALSE, pdMS_TO_TICKS(remaining_ms));
+    if (bits & WIFI_CONNECTED_BIT) return true;
+    ESP_LOGW(TAG, "%s", (bits & WIFI_FAIL_BIT)
+        ? "Disconnected while waiting for IP"
+        : "DHCP timeout (L2 was connected)");
+    return false;
+}
+
+/* Absorb the self-initiated disconnect event (it would poison the next
+ * attempt's FAIL bit) and give the AP a beat before re-authing. */
+static void wifi_disconnect_settle(void)
+{
+    esp_wifi_disconnect();
+    xEventGroupWaitBits(wifi_events, WIFI_FAIL_BIT,
+                        pdTRUE, pdFALSE, pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(500));
+}
 
 static bool wifi_connect(void)
 {
@@ -822,14 +869,11 @@ static bool wifi_connect(void)
         }
 
         WIFI_TRY(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
-        xEventGroupClearBits(wifi_events, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+        xEventGroupClearBits(wifi_events,
+                             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT | WIFI_L2_BIT);
         WIFI_TRY(esp_wifi_connect());
 
-        EventBits_t bits = xEventGroupWaitBits(wifi_events,
-            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-            pdFALSE, pdFALSE, pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
-
-        if (bits & WIFI_CONNECTED_BIT) {
+        if (wifi_wait_for_ip()) {
             wifi_ap_record_t ap;
             if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
                 wifi_channel = ap.primary;
@@ -843,21 +887,18 @@ static bool wifi_connect(void)
 
         /* Cache miss: retry this network with a full scan before moving on */
         if (wifi_cfg.sta.bssid_set) {
-            ESP_LOGW(TAG, "Fast reconnect failed for net %d, retrying with full scan...", idx);
+            ESP_LOGW(TAG, "Cached-BSSID attempt for net %d failed, retrying with full scan...", idx);
             has_wifi_cache = false;
-            esp_wifi_disconnect();
+            wifi_disconnect_settle();
 
             wifi_cfg.sta.channel = 0;
             wifi_cfg.sta.bssid_set = false;
             WIFI_TRY(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
-            xEventGroupClearBits(wifi_events, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+            xEventGroupClearBits(wifi_events,
+                                 WIFI_CONNECTED_BIT | WIFI_FAIL_BIT | WIFI_L2_BIT);
             WIFI_TRY(esp_wifi_connect());
 
-            bits = xEventGroupWaitBits(wifi_events,
-                WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                pdFALSE, pdFALSE, pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
-
-            if (bits & WIFI_CONNECTED_BIT) {
+            if (wifi_wait_for_ip()) {
                 wifi_ap_record_t ap;
                 if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
                     wifi_channel = ap.primary;
@@ -874,7 +915,7 @@ static bool wifi_connect(void)
         int next_idx = (first + step + 1) % 2;
         if (step < 1 && config.wifi_ssid[next_idx][0] != '\0') {
             ESP_LOGW(TAG, "WiFi net %d failed, trying net %d...", idx, next_idx);
-            esp_wifi_disconnect();
+            wifi_disconnect_settle();
         }
     }
 
