@@ -39,6 +39,7 @@ typedef uint32_t TickType_t;
 #define portMAX_DELAY ((TickType_t)0xFFFFFFFFU)
 #define BIT0 (1u << 0)
 #define BIT1 (1u << 1)
+#define BIT2 (1u << 2)
 
 #define configASSERT(x) ((void)(x))
 
