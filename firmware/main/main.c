@@ -1219,7 +1219,11 @@ static uint8_t *download_image(int32_t *out_sleep_seconds, int64_t *out_server_e
         esp_http_client_set_post_field(client, log_body, log_body_len);
     }
 
+    int64_t transfer_start_us = esp_timer_get_time();
     esp_err_t err = esp_http_client_perform(client);
+    unsigned long transfer_elapsed_ms = (unsigned long)
+        ((esp_timer_get_time() - transfer_start_us) / 1000);
+
     if (ctx.deadline_hit) {
         err = ESP_FAIL;
     }
@@ -1290,7 +1294,8 @@ static uint8_t *download_image(int32_t *out_sleep_seconds, int64_t *out_server_e
     }
 
     if (out_http_status) *out_http_status = status;
-    ESP_LOGI(TAG, "Downloaded %d bytes", (int)ctx.received);
+    ESP_LOGI(TAG, "Downloaded %d bytes in %lu ms",
+             (int)ctx.received, transfer_elapsed_ms);
     return buf;
 }
 
