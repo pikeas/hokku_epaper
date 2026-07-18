@@ -104,6 +104,7 @@ static const char *TAG = "hokku";
 #define WIFI_CONNECT_TIMEOUT_MS  8000   /* L2 association budget per attempt */
 #define WIFI_IP_TIMEOUT_MS      30000   /* total incl. DHCP: broadcast replies are lossy
                                          * over RF and lwIP's retry tail runs ~22 s */
+#define WIFI_LADDER_BUDGET_MS   75000
 #define HTTP_TIMEOUT_MS          30000
 
 /* ── Battery ─────────────────────────────────────────────────────── */
@@ -932,8 +933,18 @@ static bool wifi_connect(void)
     static const int retry_delays_ms[] = {1000, 2000, 4000};
     const int total_attempts = (int)(sizeof(retry_delays_ms) /
                                      sizeof(retry_delays_ms[0])) + 1;
+    int64_t ladder_start_us = esp_timer_get_time();
 
     for (int attempt = 0; attempt < total_attempts; attempt++) {
+        /* A round may legitimately run past the budget; do not interrupt an
+         * association/DHCP attempt in flight. The boundary check prevents a
+         * slow failed round from starting another full network sweep. */
+        int64_t elapsed_ms = (esp_timer_get_time() - ladder_start_us) / 1000;
+        if (attempt > 0 && elapsed_ms > WIFI_LADDER_BUDGET_MS) {
+            ESP_LOGW(TAG, "WiFi retry budget (75 s) exhausted; skipping remaining rounds");
+            break;
+        }
+
         if (wifi_connect_once()) return true;
         if (attempt == total_attempts - 1) break;
 
