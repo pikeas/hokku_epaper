@@ -821,7 +821,7 @@ static void wifi_disconnect_settle(void)
     vTaskDelay(pdMS_TO_TICKS(500));
 }
 
-static bool wifi_connect(void)
+static bool wifi_connect_once(void)
 {
     /* Create-once and reuse. Previously allocated a fresh EventGroup on
      * every call, which leaked one per button-press in the first-boot
@@ -922,6 +922,25 @@ static bool wifi_connect(void)
             ESP_LOGW(TAG, "WiFi net %d failed, trying net %d...", idx, next_idx);
             wifi_disconnect_settle();
         }
+    }
+
+    return false;
+}
+
+static bool wifi_connect(void)
+{
+    static const int retry_delays_ms[] = {1000, 2000, 4000};
+    const int total_attempts = (int)(sizeof(retry_delays_ms) /
+                                     sizeof(retry_delays_ms[0])) + 1;
+
+    for (int attempt = 0; attempt < total_attempts; attempt++) {
+        if (wifi_connect_once()) return true;
+        if (attempt == total_attempts - 1) break;
+
+        ESP_LOGW(TAG, "WiFi attempt %d/%d failed; retrying in %d ms",
+                 attempt + 1, total_attempts, retry_delays_ms[attempt]);
+        wifi_disconnect_settle();
+        vTaskDelay(pdMS_TO_TICKS(retry_delays_ms[attempt]));
     }
 
     ESP_LOGE(TAG, "WiFi connect failed");
