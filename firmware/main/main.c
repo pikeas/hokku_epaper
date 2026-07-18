@@ -99,7 +99,7 @@ static const char *TAG = "hokku";
 #define WIFI_CONNECT_TIMEOUT_MS  8000   /* L2 association budget per attempt */
 #define WIFI_IP_TIMEOUT_MS      30000   /* total incl. DHCP: broadcast replies are lossy
                                          * over RF and lwIP's retry tail runs ~22 s */
-#define HTTP_TIMEOUT_MS          30000
+#define HTTP_TIMEOUT_MS          60000
 
 /* ── Battery ─────────────────────────────────────────────────────── */
 #define BATT_LOW_MV        3400
