@@ -881,11 +881,15 @@ static bool wifi_connect_once(void)
 
         if (wifi_wait_for_ip()) {
             wifi_ap_record_t ap;
-            if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
-                wifi_channel = ap.primary;
-                memcpy(wifi_bssid, ap.bssid, 6);
-                has_wifi_cache = true;
+            esp_err_t ap_err = esp_wifi_sta_get_ap_info(&ap);
+            if (ap_err != ESP_OK) {
+                ESP_LOGW(TAG, "Association vanished after address acquisition: %s; rejecting round",
+                         esp_err_to_name(ap_err));
+                return false;
             }
+            wifi_channel = ap.primary;
+            memcpy(wifi_bssid, ap.bssid, 6);
+            has_wifi_cache = true;
             last_wifi_used_cache = wifi_cfg.sta.bssid_set;
             last_wifi_index = (uint8_t)idx;
             return true;
@@ -906,11 +910,15 @@ static bool wifi_connect_once(void)
 
             if (wifi_wait_for_ip()) {
                 wifi_ap_record_t ap;
-                if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
-                    wifi_channel = ap.primary;
-                    memcpy(wifi_bssid, ap.bssid, 6);
-                    has_wifi_cache = true;
+                esp_err_t ap_err = esp_wifi_sta_get_ap_info(&ap);
+                if (ap_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Association vanished after address acquisition: %s; rejecting round",
+                             esp_err_to_name(ap_err));
+                    return false;
                 }
+                wifi_channel = ap.primary;
+                memcpy(wifi_bssid, ap.bssid, 6);
+                has_wifi_cache = true;
                 last_wifi_used_cache = false;
                 last_wifi_index = (uint8_t)idx;
                 return true;
