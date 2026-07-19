@@ -1320,7 +1320,8 @@ static uint8_t *download_image(int32_t *out_sleep_seconds, int64_t *out_server_e
     }
 
     /* Surface any OTA-update request the server attached. Captured regardless
-     * of status (the server only sends it on the 200 image response). */
+     * of status — the server may attach it to a 200 image response or a 204
+     * no-content response. */
     if (out_fw_update && fw_update_buflen > 0) {
         out_fw_update[0] = '\0';
         if (ctx.fw_update_hdr[0] != '\0') {

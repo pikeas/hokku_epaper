@@ -42,6 +42,8 @@
 #include "mocks/nvs_flash.h"
 #include "mocks/esp_timer.h"
 #include "mocks/esp_app_desc.h"
+#include "mocks/esp_partition.h"
+#include "mocks/esp_ota_ops.h"
 
 /* ── Expose all static functions and variables from the firmware source ──
  * #define static must come AFTER the mock headers so their own static-inline
