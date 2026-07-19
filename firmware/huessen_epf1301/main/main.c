@@ -153,7 +153,7 @@ static const char *TAG = "hokku";
  * RTC_DATA_ATTR would be wrong: it's re-initialised on every esp_restart,
  * which was the root cause of the "boot_count always 1, clk_now always 0"
  * bug in the pre-redesign firmware. See docs/hardware_facts.md deep-sleep notes. */
-#define RTC_MAGIC 0x484F4B55  /* "HOKU" — validates RTC memory after POR / flash */
+#define RTC_MAGIC 0x484F4B32  /* "HOK2" — bump on any RTC_NOINIT layout change */
 
 RTC_NOINIT_ATTR static uint32_t rtc_magic;
 RTC_NOINIT_ATTR static uint32_t boot_count;
@@ -170,6 +170,13 @@ RTC_NOINIT_ATTR static uint16_t last_battery_mv;
 /* Last server-provided sleep interval (seconds), in case the next boot's
  * download fails and we need a fallback. */
 RTC_NOINIT_ATTR static int32_t  last_sleep_seconds;
+
+/* Content id of the image on glass (server's X-Content-Id, 12 hex). Sent
+ * back on timer wakes so the server can answer 204 = skip the download and
+ * the ~19 s repaint; empty = unknown -> always full refresh. Paint success
+ * is not verified: a silently failed paint leaves a stale id until the
+ * content changes or a button press forces a repaint. */
+RTC_NOINIT_ATTR static char     last_content_id[16];
 
 /* Next-refresh schedule expressed as absolute server epoch seconds.
  * This is the canonical schedule anchor — we compute deep-sleep
@@ -270,6 +277,7 @@ static void display_message(const char *msg)
     /* Display via the same path as images */
     split_and_display(fb);
     heap_caps_free(fb);
+    last_content_id[0] = '\0';  /* message overwrote the image -> repaint next wake */
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1000,6 +1008,7 @@ typedef struct {
      * capturing directly from the event stream. */
     char     sleep_seconds_hdr[32];
     char     server_epoch_hdr[32];
+    char     content_id_hdr[16];
     /* X-Firmware-Update: <version> — present when the server wants this device
      * to perform an OTA update. The body (image) is ignored when set. */
     char     fw_update_hdr[48];
@@ -1019,6 +1028,7 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
             ctx->received = 0;
             ctx->sleep_seconds_hdr[0] = '\0';
             ctx->server_epoch_hdr[0]  = '\0';
+            ctx->content_id_hdr[0]    = '\0';
             ctx->fw_update_hdr[0]     = '\0';
             break;
         case HTTP_EVENT_ON_HEADER:
@@ -1031,6 +1041,10 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
                     strncpy(ctx->server_epoch_hdr, evt->header_value,
                             sizeof(ctx->server_epoch_hdr) - 1);
                     ctx->server_epoch_hdr[sizeof(ctx->server_epoch_hdr) - 1] = '\0';
+                } else if (strcasecmp(evt->header_key, "X-Content-Id") == 0) {
+                    strncpy(ctx->content_id_hdr, evt->header_value,
+                            sizeof(ctx->content_id_hdr) - 1);
+                    ctx->content_id_hdr[sizeof(ctx->content_id_hdr) - 1] = '\0';
                 } else if (strcasecmp(evt->header_key, "X-Firmware-Update") == 0) {
                     strncpy(ctx->fw_update_hdr, evt->header_value,
                             sizeof(ctx->fw_update_hdr) - 1);
@@ -1152,7 +1166,9 @@ static uint8_t *download_image(int32_t *out_sleep_seconds, int64_t *out_server_e
                                int *out_http_status,
                                char *out_fw_update, size_t fw_update_buflen,
                                const char *wake_label,
-                               int64_t boot_time_us)
+                               int64_t boot_time_us,
+                               const char *if_content_id,
+                               char *out_content_id /* >= 16 bytes */)
 {
     uint8_t *buf = heap_caps_malloc(TOTAL_IMAGE_SIZE, MALLOC_CAP_SPIRAM);
     if (!buf) {
@@ -1185,6 +1201,10 @@ static uint8_t *download_image(int32_t *out_sleep_seconds, int64_t *out_server_e
         esp_http_client_set_header(client, "X-Screen-Name", config.screen_name);
     }
     esp_http_client_set_header(client, "X-Screen-Model", SCREEN_MODEL);
+
+    if (if_content_id != NULL && if_content_id[0] != '\0') {
+        esp_http_client_set_header(client, "X-Content-Id", if_content_id);
+    }
 
     /* Full device state in a single compact JSON header. The server
      * stores the whole dict per screen for the dashboard Details view. */
@@ -1283,6 +1303,23 @@ static uint8_t *download_image(int32_t *out_sleep_seconds, int64_t *out_server_e
 
     esp_http_client_cleanup(client);
     free(log_body);
+
+    if (out_content_id != NULL) {
+        strncpy(out_content_id, ctx.content_id_hdr, 15);
+        out_content_id[15] = '\0';
+    }
+
+    if (err == ESP_OK && status == 204) {
+        ESP_LOGI(TAG, "Server: content unchanged (204) — skipping download + repaint");
+        /* the log rode the request: reset the ring like the 200 path */
+        taskENTER_CRITICAL(&s_log_ring_mux);
+        s_log_ring_head = 0;
+        s_log_ring_used = 0;
+        taskEXIT_CRITICAL(&s_log_ring_mux);
+        if (out_http_status) *out_http_status = 204;
+        heap_caps_free(buf);
+        return NULL;
+    }
 
     if (err != ESP_OK || status != 200) {
         ESP_LOGE(TAG, "HTTP download failed: err=%s status=%d", esp_err_to_name(err), status);
@@ -1969,6 +2006,8 @@ static bool perform_refresh(const char *wake_label, int64_t boot_time_us)
     int      http_status = 0;
     int64_t local_time_at_download_us = 0;
     uint8_t *img = NULL;
+    char     new_content_id[16] = {0};
+    bool     button_wake = (wake_label != NULL && strstr(wake_label, "button") != NULL);
 
     if (!wifi_connect()) {
         ESP_LOGE(TAG, "WiFi connect failed");
@@ -1989,7 +2028,9 @@ static bool perform_refresh(const char *wake_label, int64_t boot_time_us)
 
     char fw_update_ver[48] = {0};
     img = download_image(&sleep_seconds, &server_epoch, &http_status,
-                         fw_update_ver, sizeof(fw_update_ver), wake_label, boot_time_us);
+                         fw_update_ver, sizeof(fw_update_ver), wake_label, boot_time_us,
+                         button_wake ? NULL : last_content_id,  /* button = force repaint */
+                         new_content_id);
     local_time_at_download_us = esp_timer_get_time();
 
     /* OTA path: the server asked this screen to update. The image body (if any)
@@ -2032,6 +2073,14 @@ static bool perform_refresh(const char *wake_label, int64_t boot_time_us)
     }
 
     if (!img) {
+        if (http_status == 204) {
+            /* schedule/clock were already updated from the 204's headers */
+            if (!(server_epoch > 0 && sleep_seconds > 0)) {
+                schedule_retry_in(REFRESH_RETRY_SECONDS, "204 without schedule headers");
+            }
+            log_level_apply(usb_host_present());
+            return true;
+        }
         if (http_status == 503 && sleep_seconds > 0) {
             /* Server busy (converting images, cache warming, etc.) —
              * use the server-suggested retry interval from X-Sleep-Seconds. */
@@ -2072,6 +2121,10 @@ static bool perform_refresh(const char *wake_label, int64_t boot_time_us)
     split_and_display(img);
     heap_caps_free(img);
     ESP_LOGI(TAG, "Image displayed.");
+
+    /* empty (200 without X-Content-Id) clears: unknown -> repaint next wake */
+    strncpy(last_content_id, new_content_id, sizeof(last_content_id) - 1);
+    last_content_id[sizeof(last_content_id) - 1] = '\0';
 
     /* Warn (but don't auto-restart) on stuck display. Per the new design,
      * recovery from wedged controllers is a user action (button press
@@ -2217,6 +2270,7 @@ void app_main(void)
         last_wifi_index = 0;
         last_battery_mv = 0;
         last_sleep_seconds = 0;
+        last_content_id[0] = '\0';
         next_refresh_epoch = 0;
         pre_sleep_server_epoch = 0;
         last_sleep_err_s = 0;
