@@ -100,6 +100,7 @@ static const char *TAG = "hokku";
 #define WIFI_IP_TIMEOUT_MS      30000   /* total incl. DHCP: broadcast replies are lossy
                                          * over RF and lwIP's retry tail runs ~22 s */
 #define HTTP_TIMEOUT_MS          60000
+#define TRANSFER_DEADLINE_MS     90000
 
 /* ── Battery ─────────────────────────────────────────────────────── */
 #define BATT_LOW_MV        3400
@@ -956,6 +957,8 @@ typedef struct {
     uint8_t *buf;
     size_t   received;
     size_t   capacity;
+    int64_t  transfer_start_us;
+    bool     deadline_hit;
     /* Response-header captures, populated from HTTP_EVENT_ON_HEADER in
      * http_event_handler and read by download_image after perform().
      *
@@ -969,6 +972,19 @@ typedef struct {
     char     sleep_seconds_hdr[32];
     char     server_epoch_hdr[32];
 } http_download_ctx_t;
+
+static void enforce_transfer_deadline(http_download_ctx_t *ctx,
+                                      esp_http_client_handle_t client)
+{
+    if ((esp_timer_get_time() - ctx->transfer_start_us) / 1000 >
+            TRANSFER_DEADLINE_MS) {
+        if (!ctx->deadline_hit) {
+            ESP_LOGW(TAG, "Transfer deadline (90 s) exceeded; aborting download");
+            ctx->deadline_hit = true;
+        }
+        esp_http_client_close(client);
+    }
+}
 
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
@@ -986,6 +1002,7 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
             ctx->server_epoch_hdr[0]  = '\0';
             break;
         case HTTP_EVENT_ON_HEADER:
+            enforce_transfer_deadline(ctx, evt->client);
             if (evt->header_key && evt->header_value) {
                 if (strcasecmp(evt->header_key, "X-Sleep-Seconds") == 0) {
                     strncpy(ctx->sleep_seconds_hdr, evt->header_value,
@@ -999,6 +1016,7 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
             }
             break;
         case HTTP_EVENT_ON_DATA:
+            enforce_transfer_deadline(ctx, evt->client);
             if (ctx->received + evt->data_len <= ctx->capacity) {
                 memcpy(ctx->buf + ctx->received, evt->data, evt->data_len);
                 ctx->received += evt->data_len;
@@ -1118,7 +1136,13 @@ static uint8_t *download_image(int32_t *out_sleep_seconds, int64_t *out_server_e
         return NULL;
     }
 
-    http_download_ctx_t ctx = { .buf = buf, .received = 0, .capacity = TOTAL_IMAGE_SIZE };
+    http_download_ctx_t ctx = {
+        .buf = buf,
+        .received = 0,
+        .capacity = TOTAL_IMAGE_SIZE,
+        .transfer_start_us = esp_timer_get_time(),
+        .deadline_hit = false,
+    };
 
     esp_http_client_config_t http_cfg = {
         .url = config.image_url,
@@ -1177,6 +1201,9 @@ static uint8_t *download_image(int32_t *out_sleep_seconds, int64_t *out_server_e
     }
 
     esp_err_t err = esp_http_client_perform(client);
+    if (ctx.deadline_hit) {
+        err = ESP_FAIL;
+    }
     int status = esp_http_client_get_status_code(client);
 
     /* Headers captured by http_event_handler during the response. Reading
