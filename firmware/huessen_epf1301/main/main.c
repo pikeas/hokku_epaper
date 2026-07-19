@@ -105,7 +105,8 @@ static const char *TAG = "hokku";
 #define WIFI_IP_TIMEOUT_MS      30000   /* total incl. DHCP: broadcast replies are lossy
                                          * over RF and lwIP's retry tail runs ~22 s */
 #define WIFI_LADDER_BUDGET_MS   75000
-#define HTTP_TIMEOUT_MS          30000
+#define HTTP_TIMEOUT_MS          60000
+#define TRANSFER_DEADLINE_MS     90000
 
 /* ── Battery ─────────────────────────────────────────────────────── */
 #define BATT_LOW_MV        3400
@@ -996,6 +997,8 @@ typedef struct {
     uint8_t *buf;
     size_t   received;
     size_t   capacity;
+    int64_t  transfer_start_us;
+    bool     deadline_hit;
     /* Response-header captures, populated from HTTP_EVENT_ON_HEADER in
      * http_event_handler and read by download_image after perform().
      *
@@ -1013,6 +1016,18 @@ typedef struct {
      * to perform an OTA update. The body (image) is ignored when set. */
     char     fw_update_hdr[48];
 } http_download_ctx_t;
+
+static void enforce_transfer_deadline(int64_t transfer_start_us, bool *deadline_hit,
+                                      esp_http_client_handle_t client)
+{
+    if ((esp_timer_get_time() - transfer_start_us) / 1000 > TRANSFER_DEADLINE_MS) {
+        if (!*deadline_hit) {
+            ESP_LOGW(TAG, "Transfer deadline (90 s) exceeded; aborting download");
+            *deadline_hit = true;
+        }
+        esp_http_client_close(client);
+    }
+}
 
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
@@ -1032,6 +1047,7 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
             ctx->fw_update_hdr[0]     = '\0';
             break;
         case HTTP_EVENT_ON_HEADER:
+            enforce_transfer_deadline(ctx->transfer_start_us, &ctx->deadline_hit, evt->client);
             if (evt->header_key && evt->header_value) {
                 if (strcasecmp(evt->header_key, "X-Sleep-Seconds") == 0) {
                     strncpy(ctx->sleep_seconds_hdr, evt->header_value,
@@ -1053,6 +1069,7 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
             }
             break;
         case HTTP_EVENT_ON_DATA:
+            enforce_transfer_deadline(ctx->transfer_start_us, &ctx->deadline_hit, evt->client);
             if (ctx->received + evt->data_len <= ctx->capacity) {
                 memcpy(ctx->buf + ctx->received, evt->data, evt->data_len);
                 ctx->received += evt->data_len;
@@ -1176,7 +1193,13 @@ static uint8_t *download_image(int32_t *out_sleep_seconds, int64_t *out_server_e
         return NULL;
     }
 
-    http_download_ctx_t ctx = { .buf = buf, .received = 0, .capacity = TOTAL_IMAGE_SIZE };
+    http_download_ctx_t ctx = {
+        .buf = buf,
+        .received = 0,
+        .capacity = TOTAL_IMAGE_SIZE,
+        .transfer_start_us = esp_timer_get_time(),
+        .deadline_hit = false,
+    };
 
     esp_http_client_config_t http_cfg = {
         .url = config.image_url,
@@ -1246,7 +1269,13 @@ static uint8_t *download_image(int32_t *out_sleep_seconds, int64_t *out_server_e
         esp_http_client_set_post_field(client, log_body, log_body_len);
     }
 
+    int64_t transfer_start_us = esp_timer_get_time();
     esp_err_t err = esp_http_client_perform(client);
+    unsigned long transfer_elapsed_ms = (unsigned long)
+        ((esp_timer_get_time() - transfer_start_us) / 1000);
+    if (ctx.deadline_hit) {
+        err = ESP_FAIL;
+    }
     int status = esp_http_client_get_status_code(client);
 
     /* Headers captured by http_event_handler during the response. Reading
@@ -1342,7 +1371,7 @@ static uint8_t *download_image(int32_t *out_sleep_seconds, int64_t *out_server_e
     }
 
     if (out_http_status) *out_http_status = status;
-    ESP_LOGI(TAG, "Downloaded %d bytes", (int)ctx.received);
+    ESP_LOGI(TAG, "Downloaded %d bytes in %lu ms", (int)ctx.received, transfer_elapsed_ms);
     return buf;
 }
 
@@ -1788,7 +1817,14 @@ static void build_config_state_json(char *out, size_t outlen)
 }
 
 /* ── fetch migrated NVS config image into a RAM buffer ── */
-typedef struct { uint8_t *buf; size_t len; size_t cap; bool ok; } ota_buf_ctx_t;
+typedef struct {
+    uint8_t *buf;
+    size_t len;
+    size_t cap;
+    bool ok;
+    int64_t transfer_start_us;
+    bool deadline_hit;
+} ota_buf_ctx_t;
 
 static esp_err_t ota_buf_event_handler(esp_http_client_event_t *evt)
 {
@@ -1796,10 +1832,13 @@ static esp_err_t ota_buf_event_handler(esp_http_client_event_t *evt)
     if (!ctx) return ESP_OK;
     if (evt->event_id == HTTP_EVENT_ON_CONNECTED) {
         ctx->len = 0;  /* reset on (re)connect so a redirect doesn't accumulate */
-    } else if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data_len > 0) {
-        if (ctx->len + (size_t)evt->data_len > ctx->cap) { ctx->ok = false; return ESP_FAIL; }
-        memcpy(ctx->buf + ctx->len, evt->data, evt->data_len);
-        ctx->len += evt->data_len;
+    } else if (evt->event_id == HTTP_EVENT_ON_DATA) {
+        enforce_transfer_deadline(ctx->transfer_start_us, &ctx->deadline_hit, evt->client);
+        if (evt->data_len > 0) {
+            if (ctx->len + (size_t)evt->data_len > ctx->cap) { ctx->ok = false; return ESP_FAIL; }
+            memcpy(ctx->buf + ctx->len, evt->data, evt->data_len);
+            ctx->len += evt->data_len;
+        }
     }
     return ESP_OK;
 }
@@ -1814,7 +1853,14 @@ static bool ota_fetch_config(uint8_t **out, size_t *out_len)
     size_t cap = 64 * 1024;
     uint8_t *buf = malloc(cap);
     if (!buf) { ESP_LOGE(TAG, "OTA: config buffer OOM"); return false; }
-    ota_buf_ctx_t ctx = { .buf = buf, .len = 0, .cap = cap, .ok = true };
+    ota_buf_ctx_t ctx = {
+        .buf = buf,
+        .len = 0,
+        .cap = cap,
+        .ok = true,
+        .transfer_start_us = esp_timer_get_time(),
+        .deadline_hit = false,
+    };
 
     esp_http_client_config_t cfg = {
         .url = url, .event_handler = ota_buf_event_handler, .user_data = &ctx,
@@ -1828,6 +1874,7 @@ static bool ota_fetch_config(uint8_t **out, size_t *out_len)
     esp_http_client_set_header(client, "X-Config-State", cfgstate);
 
     esp_err_t perr = esp_http_client_perform(client);
+    if (ctx.deadline_hit) perr = ESP_FAIL;
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 
@@ -1844,20 +1891,29 @@ static bool ota_fetch_config(uint8_t **out, size_t *out_len)
 }
 
 /* ── stream the app image into the inactive OTA slot ── */
-typedef struct { esp_ota_handle_t handle; size_t written; bool ok; } ota_write_ctx_t;
+typedef struct {
+    esp_ota_handle_t handle;
+    size_t written;
+    bool ok;
+    int64_t transfer_start_us;
+    bool deadline_hit;
+} ota_write_ctx_t;
 
 static esp_err_t ota_app_event_handler(esp_http_client_event_t *evt)
 {
     ota_write_ctx_t *ctx = (ota_write_ctx_t *)evt->user_data;
     if (!ctx) return ESP_OK;
-    if (evt->event_id == HTTP_EVENT_ON_DATA && ctx->ok && evt->data_len > 0) {
-        esp_err_t e = esp_ota_write(ctx->handle, evt->data, evt->data_len);
-        if (e != ESP_OK) {
-            ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(e));
-            ctx->ok = false;
-            return e;
+    if (evt->event_id == HTTP_EVENT_ON_DATA) {
+        enforce_transfer_deadline(ctx->transfer_start_us, &ctx->deadline_hit, evt->client);
+        if (ctx->ok && evt->data_len > 0) {
+            esp_err_t e = esp_ota_write(ctx->handle, evt->data, evt->data_len);
+            if (e != ESP_OK) {
+                ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(e));
+                ctx->ok = false;
+                return e;
+            }
+            ctx->written += evt->data_len;
         }
-        ctx->written += evt->data_len;
     }
     return ESP_OK;
 }
@@ -1879,7 +1935,13 @@ static bool ota_write_app(void)
 
     char url[sizeof(config.image_url) + 32];
     build_firmware_url(url, sizeof(url), "firmware.bin");
-    ota_write_ctx_t ctx = { .handle = handle, .written = 0, .ok = true };
+    ota_write_ctx_t ctx = {
+        .handle = handle,
+        .written = 0,
+        .ok = true,
+        .transfer_start_us = esp_timer_get_time(),
+        .deadline_hit = false,
+    };
     esp_http_client_config_t cfg = {
         .url = url, .event_handler = ota_app_event_handler, .user_data = &ctx,
         .timeout_ms = HTTP_TIMEOUT_MS, .buffer_size = 4096,
@@ -1887,6 +1949,7 @@ static bool ota_write_app(void)
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) { esp_ota_abort(handle); return false; }
     esp_err_t perr = esp_http_client_perform(client);
+    if (ctx.deadline_hit) perr = ESP_FAIL;
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 
