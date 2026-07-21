@@ -337,6 +337,45 @@ static void test_logger_ring_lifecycle(void)
     CHECK(n == 0 && s_log_ring_used == 0, "logger: reset clears the ring after upload");
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ *  perform_refresh: HTTP 204 "content unchanged" board branch (R5/R7)
+ *
+ *  Drives the whole board refresh with a reachable server that returns 204:
+ *  wifi connects, the download reports 204 (no image), no OTA is armed. The
+ *  204 branch must reset the outage streak, keep the schedule, paint nothing,
+ *  and report NOT painted — so app_main's `if (refreshed)
+ *  ota_mark_valid_if_pending()` gate never validates a slot on a no-op.
+ * ═══════════════════════════════════════════════════════════════════════ */
+static void test_perform_refresh_204_not_painted(void)
+{
+    mock_eg_reset();
+    mock_http_reset();
+    _mock_timer_us = 0;
+
+    memset(&config, 0, sizeof(config));
+    config.cfg_ver = CONFIG_VERSION;
+    strcpy(config.wifi_ssid[0], "net0");
+    strcpy(config.image_url, "http://h/hokku/screen/");
+    has_wifi_cache = false;
+
+    consecutive_refresh_failures = 5;            /* a pre-existing outage streak */
+    strcpy(last_content_id, "oldid0000000");
+
+    mock_wifi_set_ap_info(0, 6);                 /* wifi_connect -> success */
+    mock_eg_push(WIFI_CONNECTED_BIT);
+
+    mock_http_push_event(HTTP_EVENT_ON_CONNECTED, NULL, NULL, NULL, 0);
+    mock_http_push_header((char *)"X-Sleep-Seconds", (char *)"300");
+    mock_http_push_header((char *)"X-Server-Time-Epoch", (char *)"1700000000");
+    mock_http_set_result(ESP_OK, 204);           /* content unchanged */
+
+    bool painted = perform_refresh("timer", 0);
+    CHECK(!painted, "huessen: 204 reports NOT painted (app_main won't validate a pending OTA)");
+    CHECK(consecutive_refresh_failures == 0, "huessen: 204 clears the outage streak (server reachable)");
+    CHECK(strcmp(last_content_id, "oldid0000000") == 0,
+          "huessen: 204 leaves the stored content id unchanged");
+}
+
 int main(void)
 {
     /* All mock GPIO pins start at 0 (LOW). Set defaults appropriate for the
@@ -375,6 +414,9 @@ int main(void)
 
     /* Logger (single RTC ring) */
     test_logger_ring_lifecycle();
+
+    /* perform_refresh 204 board branch */
+    test_perform_refresh_204_not_painted();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return (g_fail > 0) ? 1 : 0;
