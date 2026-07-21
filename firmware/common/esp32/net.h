@@ -22,14 +22,19 @@ typedef struct {
     int     *out_http_status;     /* HTTP status code */
     char    *out_fw_update;       /* X-Firmware-Update version string (empty if none) */
     size_t   fw_update_buflen;    /* size of out_fw_update */
+    char    *out_content_id;      /* response X-Content-Id (empty if none) */
+    size_t   content_id_buflen;   /* size of out_content_id */
 } hokku_fetch_out_t;
 
 /* Fetch the screen image into buf (capacity = expect_bytes; caller owns it).
  * frame_state is the caller-built X-Frame-State JSON. fw_build is the compile
- * stamp (X-Firmware-Build); the version comes from the app descriptor. On a 200
- * with exactly expect_bytes received, resets the log ring and returns true;
- * otherwise returns false (buf left untouched for the caller to free). */
+ * stamp (X-Firmware-Build); the version comes from the app descriptor.
+ * if_content_id is the X-Content-Id request header for skip-refresh; NULL or
+ * empty means don't send it. On a 200 with exactly expect_bytes received,
+ * resets the log ring and returns true; otherwise returns false (buf left
+ * untouched for the caller to free). */
 bool hokku_http_fetch_image(uint8_t *buf, size_t expect_bytes,
                             const char *url, const char *screen_name,
                             const char *screen_model, const char *frame_state,
-                            const char *fw_build, hokku_fetch_out_t *out);
+                            const char *fw_build, const char *if_content_id,
+                            hokku_fetch_out_t *out);

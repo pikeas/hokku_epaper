@@ -507,7 +507,7 @@ static void perform_refresh(const char *wake_label, int64_t boot_time_us)
 
     bool ok = hokku_http_fetch_image(img, TOTAL_IMAGE_SIZE, config.image_url,
                                      config.screen_name, SCREEN_MODEL, frame_state,
-                                     FW_BUILD_TIMESTAMP, &out);
+                                     FW_BUILD_TIMESTAMP, NULL, &out);
 
     /* Server-requested OTA: the image body is ignored; update instead. */
     if (fw_update[0] != '\0') {

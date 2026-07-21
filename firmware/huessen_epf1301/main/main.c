@@ -194,6 +194,7 @@ static void display_message(const char *msg)
     /* Display via the same path as images */
     split_and_display(fb);
     heap_caps_free(fb);
+    last_content_id[0] = '\0';  /* message overwrote the image -> repaint next wake */
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -758,7 +759,9 @@ static uint8_t *download_image(int32_t *out_sleep_seconds, int64_t *out_server_e
                                int *out_http_status,
                                char *out_fw_update, size_t fw_update_buflen,
                                const char *wake_label,
-                               int64_t boot_time_us)
+                               int64_t boot_time_us,
+                               const char *if_content_id,
+                               char *out_content_id /* >= 16 bytes */)
 {
     /* Board bits (image size + PSRAM alloc + the frame-state gatherer) live
      * here; the HTTP transport + header capture + clock sync are shared, in
@@ -780,10 +783,12 @@ static uint8_t *download_image(int32_t *out_sleep_seconds, int64_t *out_server_e
         .out_http_status   = out_http_status,
         .out_fw_update     = out_fw_update,
         .fw_update_buflen  = fw_update_buflen,
+        .out_content_id    = out_content_id,
+        .content_id_buflen = 16,
     };
     if (!hokku_http_fetch_image(buf, TOTAL_IMAGE_SIZE, config.image_url,
                                 config.screen_name, SCREEN_MODEL, frame_state,
-                                FW_BUILD_TIMESTAMP, &out)) {
+                                FW_BUILD_TIMESTAMP, if_content_id, &out)) {
         heap_caps_free(buf);
         return NULL;
     }
@@ -1093,6 +1098,8 @@ static bool perform_refresh(const char *wake_label, int64_t boot_time_us)
     int      http_status = 0;
     int64_t local_time_at_download_us = 0;
     uint8_t *img = NULL;
+    char     new_content_id[16] = {0};
+    bool     button_wake = (wake_label != NULL && strstr(wake_label, "button") != NULL);
 
     if (!wifi_connect()) {
         ESP_LOGE(TAG, "WiFi connect failed");
@@ -1118,7 +1125,9 @@ static bool perform_refresh(const char *wake_label, int64_t boot_time_us)
 
     char fw_update_ver[48] = {0};
     img = download_image(&sleep_seconds, &server_epoch, &http_status,
-                         fw_update_ver, sizeof(fw_update_ver), wake_label, boot_time_us);
+                         fw_update_ver, sizeof(fw_update_ver), wake_label, boot_time_us,
+                         button_wake ? NULL : last_content_id,
+                         new_content_id);
     local_time_at_download_us = esp_timer_get_time();
 
     /* OTA path: the server asked this screen to update. The image body (if any)
@@ -1162,6 +1171,21 @@ static bool perform_refresh(const char *wake_label, int64_t boot_time_us)
     }
 
     if (!img) {
+        if (http_status == 204) {
+            /* Server: content unchanged — reachable + healthy. Clear the outage
+             * streak (exactly once), keep the schedule already applied from the
+             * 204's headers (fall back to a short retry if they were missing),
+             * paint nothing, and report NOT painted so a no-op can never validate
+             * a pending OTA. The log rode the request — reset the ring here (this
+             * board-specific branch owns the 204 reset). */
+            consecutive_refresh_failures = 0;
+            hokku_log_reset();
+            if (!(server_epoch > 0 && sleep_seconds > 0)) {
+                schedule_retry_in(REFRESH_RETRY_SECONDS, "204 without schedule headers");
+            }
+            log_level_apply(usb_host_present());
+            return false;
+        }
         if (http_status == 503 && sleep_seconds > 0) {
             /* Server busy (converting images, cache warming, etc.) — it IS
              * reachable, so clear the outage streak and use the server-suggested
@@ -1213,6 +1237,10 @@ static bool perform_refresh(const char *wake_label, int64_t boot_time_us)
     split_and_display(img);
     heap_caps_free(img);
     ESP_LOGI(TAG, "Image displayed.");
+
+    /* Empty (200 without X-Content-Id) clears it: unknown -> repaint next wake. */
+    strncpy(last_content_id, new_content_id, sizeof(last_content_id) - 1);
+    last_content_id[sizeof(last_content_id) - 1] = '\0';
 
     /* No post-display BUSY check here: split_and_display's shutdown sequence
      * switches BUSY to OUTPUT and drives it LOW to bleed the signal line, so
