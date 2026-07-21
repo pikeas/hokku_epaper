@@ -1180,6 +1180,7 @@ static bool perform_refresh(const char *wake_label, int64_t boot_time_us)
              * board-specific branch owns the 204 reset). */
             consecutive_refresh_failures = 0;
             hokku_log_reset();
+            ESP_LOGI(TAG, "Server: content unchanged (204) — skipping download + repaint");
             if (!(server_epoch > 0 && sleep_seconds > 0)) {
                 schedule_retry_in(REFRESH_RETRY_SECONDS, "204 without schedule headers");
             }

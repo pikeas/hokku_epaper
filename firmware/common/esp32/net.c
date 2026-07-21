@@ -222,8 +222,11 @@ bool hokku_http_fetch_image(uint8_t *buf, size_t expect_bytes,
     if (out && out->out_http_status) *out->out_http_status = status;
 
     if (err == ESP_OK && status == 204) {
-        ESP_LOGI("hokku", "Server: content unchanged (204) — skipping download + repaint");
-        return false;   /* not a complete image; contract unchanged. Ring reset is board-specific (Huessen's 204 branch). */
+        /* Not a complete image; bool contract unchanged. Logged by the board's
+         * 204 branch AFTER its ring reset so the line survives into the next
+         * POSTed ring (a pre-reset log is wiped before the server ever sees it —
+         * same reason the success line below sits after hokku_log_reset). */
+        return false;
     }
 
     if (err != ESP_OK || status != 200) {
