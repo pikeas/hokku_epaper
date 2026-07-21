@@ -11,11 +11,16 @@
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+
+#define IMAGE_TRANSFER_DEADLINE_MS  90000
 
 typedef struct {
     uint8_t *buf;
     size_t   received;
     size_t   capacity;
+    int64_t  transfer_start_us;
+    bool     deadline_hit;
     /* Response-header captures, populated from HTTP_EVENT_ON_HEADER and read
      * after perform(). (Capturing from the event stream is the only correct
      * way — esp_http_client_get_header() reads REQUEST headers, not response.) */
@@ -26,6 +31,19 @@ typedef struct {
      * to OTA. The body (image) is ignored when set. */
     char     fw_update_hdr[48];
 } http_download_ctx_t;
+
+void hokku_enforce_transfer_deadline(int64_t start_us, int32_t deadline_ms,
+                                     esp_http_client_handle_t client,
+                                     bool *deadline_hit, const char *what)
+{
+    if ((esp_timer_get_time() - start_us) / 1000 <= deadline_ms) return;
+    if (deadline_hit && !*deadline_hit) {
+        ESP_LOGW("hokku", "Transfer deadline (%d s) exceeded; aborting %s",
+                 (int)(deadline_ms / 1000), what);
+        *deadline_hit = true;
+    }
+    esp_http_client_close(client);
+}
 
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
@@ -45,6 +63,9 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
             ctx->fw_update_hdr[0]     = '\0';
             break;
         case HTTP_EVENT_ON_HEADER:
+            hokku_enforce_transfer_deadline(ctx->transfer_start_us,
+                                            IMAGE_TRANSFER_DEADLINE_MS, evt->client,
+                                            &ctx->deadline_hit, "download");
             if (evt->header_key && evt->header_value) {
                 if (strcasecmp(evt->header_key, "X-Sleep-Seconds") == 0) {
                     strncpy(ctx->sleep_seconds_hdr, evt->header_value,
@@ -66,6 +87,9 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
             }
             break;
         case HTTP_EVENT_ON_DATA:
+            hokku_enforce_transfer_deadline(ctx->transfer_start_us,
+                                            IMAGE_TRANSFER_DEADLINE_MS, evt->client,
+                                            &ctx->deadline_hit, "download");
             if (ctx->received + evt->data_len <= ctx->capacity) {
                 memcpy(ctx->buf + ctx->received, evt->data, evt->data_len);
                 ctx->received += evt->data_len;
@@ -83,7 +107,13 @@ bool hokku_http_fetch_image(uint8_t *buf, size_t expect_bytes,
                             const char *fw_build, const char *if_content_id,
                             hokku_fetch_out_t *out)
 {
-    http_download_ctx_t ctx = { .buf = buf, .received = 0, .capacity = expect_bytes };
+    http_download_ctx_t ctx = {
+        .buf = buf,
+        .received = 0,
+        .capacity = expect_bytes,
+        .transfer_start_us = esp_timer_get_time(),
+        .deadline_hit = false,
+    };
 
     esp_http_client_config_t http_cfg = {
         .url = url,
@@ -129,7 +159,13 @@ bool hokku_http_fetch_image(uint8_t *buf, size_t expect_bytes,
         esp_http_client_set_post_field(client, log_body, log_body_len);
     }
 
+    int64_t perform_start_us = esp_timer_get_time();
     esp_err_t err = esp_http_client_perform(client);
+    unsigned long perform_elapsed_ms = (unsigned long)
+        ((esp_timer_get_time() - perform_start_us) / 1000);
+    if (ctx.deadline_hit) {
+        err = ESP_FAIL;
+    }
     int status = esp_http_client_get_status_code(client);
 
     /* Response headers captured during perform() — safe to read now (copied
@@ -205,6 +241,7 @@ bool hokku_http_fetch_image(uint8_t *buf, size_t expect_bytes,
         return false;
     }
 
-    ESP_LOGI("hokku", "Downloaded %d bytes", (int)ctx.received);
+    ESP_LOGI("hokku", "Downloaded %d bytes in %lu ms",
+             (int)ctx.received, perform_elapsed_ms);
     return true;
 }

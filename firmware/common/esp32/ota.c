@@ -15,8 +15,11 @@
 #include "esp_partition.h"
 #include "nvs_flash.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #define PROGRESS(msg) do { if (progress) progress(msg); } while (0)
+#define OTA_CONFIG_TRANSFER_DEADLINE_MS  30000
+#define OTA_APP_TRANSFER_DEADLINE_MS    120000
 
 /* Build the X-Config-State header: the device's current NVS config as JSON so
  * the server can migrate it forward into the new firmware's schema. */
@@ -39,7 +42,14 @@ static void build_config_state_json(char *out, size_t outlen)
 }
 
 /* ── fetch migrated NVS config image into a RAM buffer ── */
-typedef struct { uint8_t *buf; size_t len; size_t cap; bool ok; } ota_buf_ctx_t;
+typedef struct {
+    uint8_t *buf;
+    size_t len;
+    size_t cap;
+    bool ok;
+    int64_t transfer_start_us;
+    bool deadline_hit;
+} ota_buf_ctx_t;
 
 static esp_err_t ota_buf_event_handler(esp_http_client_event_t *evt)
 {
@@ -47,10 +57,19 @@ static esp_err_t ota_buf_event_handler(esp_http_client_event_t *evt)
     if (!ctx) return ESP_OK;
     if (evt->event_id == HTTP_EVENT_ON_CONNECTED) {
         ctx->len = 0;  /* reset on (re)connect so a redirect doesn't accumulate */
-    } else if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data_len > 0) {
-        if (ctx->len + (size_t)evt->data_len > ctx->cap) { ctx->ok = false; return ESP_FAIL; }
-        memcpy(ctx->buf + ctx->len, evt->data, evt->data_len);
-        ctx->len += evt->data_len;
+    } else if (evt->event_id == HTTP_EVENT_ON_HEADER) {
+        hokku_enforce_transfer_deadline(ctx->transfer_start_us,
+                                        OTA_CONFIG_TRANSFER_DEADLINE_MS, evt->client,
+                                        &ctx->deadline_hit, "OTA config");
+    } else if (evt->event_id == HTTP_EVENT_ON_DATA) {
+        hokku_enforce_transfer_deadline(ctx->transfer_start_us,
+                                        OTA_CONFIG_TRANSFER_DEADLINE_MS, evt->client,
+                                        &ctx->deadline_hit, "OTA config");
+        if (evt->data_len > 0) {
+            if (ctx->len + (size_t)evt->data_len > ctx->cap) { ctx->ok = false; return ESP_FAIL; }
+            memcpy(ctx->buf + ctx->len, evt->data, evt->data_len);
+            ctx->len += evt->data_len;
+        }
     }
     return ESP_OK;
 }
@@ -66,11 +85,19 @@ static bool ota_fetch_config(const char *base_url, const char *screen_name,
     size_t cap = 64 * 1024;
     uint8_t *buf = malloc(cap);
     if (!buf) { ESP_LOGE("hokku", "OTA: config buffer OOM"); return false; }
-    ota_buf_ctx_t ctx = { .buf = buf, .len = 0, .cap = cap, .ok = true };
+    ota_buf_ctx_t ctx = {
+        .buf = buf,
+        .len = 0,
+        .cap = cap,
+        .ok = true,
+        .transfer_start_us = esp_timer_get_time(),
+        .deadline_hit = false,
+    };
 
     esp_http_client_config_t cfg = {
         .url = url, .event_handler = ota_buf_event_handler, .user_data = &ctx,
         .timeout_ms = HTTP_TIMEOUT_MS, .buffer_size = 4096,
+        .disable_auto_redirect = true,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) { free(buf); return false; }
@@ -81,6 +108,7 @@ static bool ota_fetch_config(const char *base_url, const char *screen_name,
     esp_http_client_set_header(client, "X-Config-State", cfgstate);
 
     esp_err_t perr = esp_http_client_perform(client);
+    if (ctx.deadline_hit) perr = ESP_FAIL;
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 
@@ -97,20 +125,35 @@ static bool ota_fetch_config(const char *base_url, const char *screen_name,
 }
 
 /* ── stream the app image into the inactive OTA slot ── */
-typedef struct { esp_ota_handle_t handle; size_t written; bool ok; } ota_write_ctx_t;
+typedef struct {
+    esp_ota_handle_t handle;
+    size_t written;
+    bool ok;
+    int64_t transfer_start_us;
+    bool deadline_hit;
+} ota_write_ctx_t;
 
 static esp_err_t ota_app_event_handler(esp_http_client_event_t *evt)
 {
     ota_write_ctx_t *ctx = (ota_write_ctx_t *)evt->user_data;
     if (!ctx) return ESP_OK;
-    if (evt->event_id == HTTP_EVENT_ON_DATA && ctx->ok && evt->data_len > 0) {
-        esp_err_t e = esp_ota_write(ctx->handle, evt->data, evt->data_len);
-        if (e != ESP_OK) {
-            ESP_LOGE("hokku", "esp_ota_write failed: %s", esp_err_to_name(e));
-            ctx->ok = false;
-            return e;
+    if (evt->event_id == HTTP_EVENT_ON_HEADER) {
+        hokku_enforce_transfer_deadline(ctx->transfer_start_us,
+                                        OTA_APP_TRANSFER_DEADLINE_MS, evt->client,
+                                        &ctx->deadline_hit, "OTA app");
+    } else if (evt->event_id == HTTP_EVENT_ON_DATA) {
+        hokku_enforce_transfer_deadline(ctx->transfer_start_us,
+                                        OTA_APP_TRANSFER_DEADLINE_MS, evt->client,
+                                        &ctx->deadline_hit, "OTA app");
+        if (ctx->ok && evt->data_len > 0) {
+            esp_err_t e = esp_ota_write(ctx->handle, evt->data, evt->data_len);
+            if (e != ESP_OK) {
+                ESP_LOGE("hokku", "esp_ota_write failed: %s", esp_err_to_name(e));
+                ctx->ok = false;
+                return e;
+            }
+            ctx->written += evt->data_len;
         }
-        ctx->written += evt->data_len;
     }
     return ESP_OK;
 }
@@ -133,10 +176,17 @@ static bool ota_write_app(const char *base_url, const char *screen_name,
 
     char url[257 + 32];
     firmware_url_build(url, sizeof(url), base_url, "firmware.bin");
-    ota_write_ctx_t ctx = { .handle = handle, .written = 0, .ok = true };
+    ota_write_ctx_t ctx = {
+        .handle = handle,
+        .written = 0,
+        .ok = true,
+        .transfer_start_us = esp_timer_get_time(),
+        .deadline_hit = false,
+    };
     esp_http_client_config_t cfg = {
         .url = url, .event_handler = ota_app_event_handler, .user_data = &ctx,
         .timeout_ms = HTTP_TIMEOUT_MS, .buffer_size = 4096,
+        .disable_auto_redirect = true,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) { esp_ota_abort(handle); return false; }
@@ -145,6 +195,7 @@ static bool ota_write_app(const char *base_url, const char *screen_name,
     if (screen_model && screen_model[0] != '\0')
         esp_http_client_set_header(client, "X-Screen-Model", screen_model);
     esp_err_t perr = esp_http_client_perform(client);
+    if (ctx.deadline_hit) perr = ESP_FAIL;
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 

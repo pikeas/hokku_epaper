@@ -13,7 +13,13 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#define HTTP_TIMEOUT_MS  30000
+#include "esp_http_client.h"
+
+#define HTTP_TIMEOUT_MS  60000
+
+void hokku_enforce_transfer_deadline(int64_t start_us, int32_t deadline_ms,
+                                     esp_http_client_handle_t client,
+                                     bool *deadline_hit, const char *what);
 
 /* Outputs captured from the response. Any pointer may be NULL. */
 typedef struct {
