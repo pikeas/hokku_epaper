@@ -178,6 +178,11 @@ static spi_device_handle_t spi_handle;
  * Sent via split_and_display — same path as downloaded images. */
 static void display_message(const char *msg)
 {
+    /* Clear before the alloc can fail: a spuriously empty id only forces a
+     * repaint, but a stale id surviving an OOM here could 204-starve a
+     * pending-verify boot and roll back a good OTA. */
+    last_content_id[0] = '\0';
+
     uint8_t *fb = heap_caps_malloc(TOTAL_IMAGE_SIZE, MALLOC_CAP_SPIRAM);
     if (!fb) {
         ESP_LOGE(TAG, "Cannot allocate framebuffer for message");
@@ -194,7 +199,6 @@ static void display_message(const char *msg)
     /* Display via the same path as images */
     split_and_display(fb);
     heap_caps_free(fb);
-    last_content_id[0] = '\0';  /* message overwrote the image -> repaint next wake */
 }
 
 /* ═══════════════════════════════════════════════════════════════════
