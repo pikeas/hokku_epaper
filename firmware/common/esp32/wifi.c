@@ -6,15 +6,19 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/task.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
-#define WIFI_CONNECT_TIMEOUT_MS  15000  /* per-network attempt; WPA3-SAE assoc + DHCP can be slow on mesh APs */
+#define WIFI_CONNECT_TIMEOUT_MS  15000  /* L2 association budget per attempt */
+#define WIFI_IP_TIMEOUT_MS       30000  /* total per-attempt budget including DHCP */
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
+#define WIFI_L2_BIT        BIT2
 
 bool last_wifi_used_cache = false;
 
@@ -24,7 +28,9 @@ static bool               wifi_inited = false;
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
 {
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
+        xEventGroupSetBits(wifi_events, WIFI_L2_BIT);
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupSetBits(wifi_events, WIFI_FAIL_BIT);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
@@ -63,6 +69,54 @@ static void wifi_init_once(void)
     }                                                                           \
 } while (0)
 
+/* Association and DHCP are separate failure domains; slow DHCP must not tear
+ * down a healthy L2 association. */
+static bool wifi_wait_for_ip(void)
+{
+    int64_t attempt_start_us = esp_timer_get_time();
+    int64_t association_deadline_us =
+        attempt_start_us + (int64_t)WIFI_CONNECT_TIMEOUT_MS * 1000;
+    int64_t association_ms =
+        (association_deadline_us - esp_timer_get_time()) / 1000;
+    if (association_ms < 1) association_ms = 1;
+
+    EventBits_t bits = xEventGroupWaitBits(wifi_events,
+        WIFI_CONNECTED_BIT | WIFI_L2_BIT | WIFI_FAIL_BIT,
+        pdFALSE, pdFALSE, pdMS_TO_TICKS(association_ms));
+    if (bits & WIFI_CONNECTED_BIT) return true;
+    if (bits & WIFI_FAIL_BIT) return false;
+    if (!(bits & WIFI_L2_BIT)) {
+        ESP_LOGW("hokku", "No association within %d ms", WIFI_CONNECT_TIMEOUT_MS);
+        return false;
+    }
+
+    int64_t attempt_deadline_us =
+        attempt_start_us + (int64_t)WIFI_IP_TIMEOUT_MS * 1000;
+    int64_t remaining_ms =
+        (attempt_deadline_us - esp_timer_get_time()) / 1000;
+    if (remaining_ms < 1000) remaining_ms = 1000;
+    ESP_LOGI("hokku", "L2 up, waiting for IP (DHCP, %lld ms budget)...",
+             (long long)remaining_ms);
+    bits = xEventGroupWaitBits(wifi_events,
+        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+        pdFALSE, pdFALSE, pdMS_TO_TICKS(remaining_ms));
+    if (bits & WIFI_CONNECTED_BIT) return true;
+    if (bits & WIFI_FAIL_BIT) {
+        ESP_LOGW("hokku", "Disconnected while waiting for IP");
+    } else {
+        ESP_LOGW("hokku", "DHCP timeout (L2 was connected)");
+    }
+    return false;
+}
+
+static void wifi_disconnect_settle(void)
+{
+    esp_wifi_disconnect();
+    xEventGroupWaitBits(wifi_events, WIFI_FAIL_BIT,
+                        pdTRUE, pdFALSE, pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(500));
+}
+
 bool wifi_connect(void)
 {
     /* Create-once and reuse. Previously allocated a fresh EventGroup on every
@@ -70,7 +124,8 @@ bool wifi_connect(void)
     if (wifi_events == NULL) {
         wifi_events = xEventGroupCreate();
     } else {
-        xEventGroupClearBits(wifi_events, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+        xEventGroupClearBits(wifi_events,
+                             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT | WIFI_L2_BIT);
     }
     wifi_init_once();
 
@@ -123,14 +178,11 @@ bool wifi_connect(void)
         }
 
         WIFI_TRY(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
-        xEventGroupClearBits(wifi_events, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+        xEventGroupClearBits(wifi_events,
+                             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT | WIFI_L2_BIT);
         WIFI_TRY(esp_wifi_connect());
 
-        EventBits_t bits = xEventGroupWaitBits(wifi_events,
-            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-            pdFALSE, pdFALSE, pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
-
-        if (bits & WIFI_CONNECTED_BIT) {
+        if (wifi_wait_for_ip()) {
             wifi_ap_record_t ap;
             if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
                 wifi_channel = ap.primary;
@@ -144,21 +196,18 @@ bool wifi_connect(void)
 
         /* Cache miss: retry this network with a full scan before moving on */
         if (wifi_cfg.sta.bssid_set) {
-            ESP_LOGW("hokku", "Fast reconnect failed for net %d, retrying with full scan...", idx);
+            ESP_LOGW("hokku", "Cached-BSSID attempt for net %d failed, retrying with full scan...", idx);
             has_wifi_cache = false;
-            esp_wifi_disconnect();
+            wifi_disconnect_settle();
 
             wifi_cfg.sta.channel = 0;
             wifi_cfg.sta.bssid_set = false;
             WIFI_TRY(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
-            xEventGroupClearBits(wifi_events, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+            xEventGroupClearBits(wifi_events,
+                                 WIFI_CONNECTED_BIT | WIFI_FAIL_BIT | WIFI_L2_BIT);
             WIFI_TRY(esp_wifi_connect());
 
-            bits = xEventGroupWaitBits(wifi_events,
-                WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                pdFALSE, pdFALSE, pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
-
-            if (bits & WIFI_CONNECTED_BIT) {
+            if (wifi_wait_for_ip()) {
                 wifi_ap_record_t ap;
                 if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
                     wifi_channel = ap.primary;
@@ -175,7 +224,7 @@ bool wifi_connect(void)
         int next_idx = (first + step + 1) % 2;
         if (step < 1 && config.wifi_ssid[next_idx][0] != '\0') {
             ESP_LOGW("hokku", "WiFi net %d failed, trying net %d...", idx, next_idx);
-            esp_wifi_disconnect();
+            wifi_disconnect_settle();
         }
     }
 
