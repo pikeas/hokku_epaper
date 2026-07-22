@@ -333,6 +333,46 @@ static void test_net_200_paint(void)
     CHECK(s_log_ring_used == 0, "net: 200 resets the log ring");
 }
 
+/* perform() completes a full 200 body but the transfer ran past the 90 s
+ * deadline: the post-perform deadline_hit fold must force failure and skip the
+ * ring reset, discarding the completed-but-overdue image (R6 reviewer). */
+static void test_net_completed_but_overdue_discarded(void)
+{
+    reset_mocks();
+    s_log_ring_head = 0; s_log_ring_used = 0;
+    hokku_log_init();
+    call_log("overdue");
+    size_t used_before = s_log_ring_used;
+
+    uint8_t payload[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint8_t buf[8] = {0};
+    mock_http_set_advance_us(100000000);   /* +100 s per event -> trips the 90 s deadline mid-replay */
+    mock_http_push_event(HTTP_EVENT_ON_CONNECTED, NULL, NULL, NULL, 0);
+    mock_http_push_data(payload, sizeof(payload));   /* full body still delivered */
+    mock_http_set_result(ESP_OK, 200);     /* server returned a clean 200 */
+
+    int status = 0;
+    hokku_fetch_out_t out = { .out_http_status = &status };
+    bool r = hokku_http_fetch_image(buf, sizeof(buf), "http://h/", "n", "M", "{}", "b", NULL, &out);
+    CHECK(!r, "net: completed-but-overdue 200 is discarded (deadline_hit folds to failure)");
+    CHECK(status == 200, "net: overdue transfer still surfaces the server's 200");
+    CHECK(s_log_ring_used == used_before, "net: overdue transfer does NOT reset the log ring");
+}
+
+/* wifi_disconnect_settle clamps its FAIL-wait and delay to the shared deadline;
+ * past the deadline it must not wait at all (R2 reviewer: settle-clamp race). */
+static void test_wifi_settle_respects_deadline(void)
+{
+    reset_mocks();
+    _mock_timer_us = 100000;                    /* now = 0.1 s */
+    wifi_disconnect_settle(50000);              /* deadline already 0.05 s in the past */
+    CHECK(_mock_eg_wait_calls == 0, "wifi: settle past the deadline skips its clamped FAIL-wait");
+
+    reset_mocks();
+    wifi_disconnect_settle(75000000);           /* deadline 75 s ahead */
+    CHECK(_mock_eg_wait_calls == 1, "wifi: settle within budget performs its one FAIL-wait");
+}
+
 int main(void)
 {
     printf("=== test_logic (common/esp32) ===\n\n");
@@ -351,6 +391,8 @@ int main(void)
     test_net_transfer_deadline();
     test_net_204_skip();
     test_net_200_paint();
+    test_net_completed_but_overdue_discarded();
+    test_wifi_settle_respects_deadline();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return (g_fail > 0) ? 1 : 0;
 }

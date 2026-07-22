@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include "esp_timer.h"   /* _mock_timer_us, so a scripted transfer can age past its deadline */
 
 typedef void *esp_http_client_handle_t;
 
@@ -66,6 +67,7 @@ static struct {
     int     perform_result;   /* returned by esp_http_client_perform */
     int     status_code;      /* returned by esp_http_client_get_status_code */
     int     close_calls;
+    int64_t advance_us;       /* added to the mock clock before each replayed event */
     bool    disable_auto_redirect_seen;
 } _mock_http;
 
@@ -76,8 +78,10 @@ static inline void mock_http_reset(void) {
     _mock_http.perform_result = -1;
     _mock_http.status_code = 0;
     _mock_http.close_calls = 0;
+    _mock_http.advance_us = 0;
     _mock_http.disable_auto_redirect_seen = false;
 }
+static inline void mock_http_set_advance_us(int64_t us) { _mock_http.advance_us = us; }
 static inline void mock_http_set_result(int perform_result, int status_code) {
     _mock_http.perform_result = perform_result;
     _mock_http.status_code = status_code;
@@ -109,6 +113,7 @@ static inline int esp_http_client_set_header(esp_http_client_handle_t c, const c
 static inline int esp_http_client_perform(esp_http_client_handle_t c) {
     if (_mock_http.handler) {
         for (int i = 0; i < _mock_http.script_len; i++) {
+            _mock_timer_us += _mock_http.advance_us;   /* age the transfer per event */
             mock_http_event_t *s = &_mock_http.script[i];
             esp_http_client_event_t evt = {
                 .event_id = s->id, .client = c, .user_data = _mock_http.user_data,
