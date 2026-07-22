@@ -23,4 +23,9 @@ esptool.py --chip esp32s3 merge_bin \
     0x8000  build/partition_table/partition-table.bin \
     0x10000 build/hokku_epaper.bin
 
+# App-only image alongside the merged one, for servers that consume the raw
+# app image directly instead of slicing it out of the merged binary.
+cp build/hokku_epaper.bin ../release/hokku-huessen_epf1301-app-${VERSION}.bin
+
 echo "Merged: firmware/release/hokku-huessen_epf1301-${VERSION}.bin"
+echo "App:    firmware/release/hokku-huessen_epf1301-app-${VERSION}.bin"
