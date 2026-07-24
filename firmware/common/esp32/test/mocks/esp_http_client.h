@@ -35,6 +35,7 @@ typedef struct {
     int                   timeout_ms;
     int                   buffer_size;
     bool                  disable_auto_redirect;
+    int                   buffer_size_tx;
 } esp_http_client_config_t;
 
 typedef enum {
