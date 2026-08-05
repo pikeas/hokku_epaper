@@ -43,7 +43,18 @@ static inline int esp_wifi_connect(void)    { return 0; }
 static inline int esp_wifi_disconnect(void) { return 0; }
 static inline int esp_wifi_stop(void)       { return 0; }
 static inline int esp_wifi_deinit(void)     { return 0; }
-static inline int esp_wifi_sta_get_ap_info(wifi_ap_record_t *ap) { (void)ap; return -1; }
+/* Programmable mock: default -1 (failure, matching the original stub). Tests set
+ * _mock_ap_info_result = 0 and fill _mock_ap_record to simulate a live AP. */
+static int             _mock_ap_info_result = -1;
+static wifi_ap_record_t _mock_ap_record;
+static inline void mock_wifi_set_ap_info(int result, uint8_t primary) {
+    _mock_ap_info_result = result;
+    _mock_ap_record.primary = primary;
+}
+static inline int esp_wifi_sta_get_ap_info(wifi_ap_record_t *ap) {
+    if (_mock_ap_info_result == 0 && ap) *ap = _mock_ap_record;
+    return _mock_ap_info_result;
+}
 static inline int esp_wifi_get_mac(wifi_interface_t i, uint8_t *mac) {
     (void)i; (void)mac; return 0;
 }

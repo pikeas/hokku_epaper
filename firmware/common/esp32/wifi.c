@@ -15,6 +15,8 @@
 
 #define WIFI_CONNECT_TIMEOUT_MS  15000  /* L2 association budget per attempt */
 #define WIFI_IP_TIMEOUT_MS       30000  /* total per-attempt budget including DHCP */
+#define WIFI_LADDER_BUDGET_MS    75000
+#define WIFI_DEADLINE_EPSILON_MS 50
 /* IDF's esp_netif_set_hostname rejects longer names (private limit in esp_netif_lwip.c). */
 #define WIFI_HOSTNAME_MAX_LEN    32
 
@@ -44,6 +46,11 @@ static void wifi_sanitize_hostname(const char *screen_name,
     }
     while (len > 0 && hostname[len - 1] == '-') len--;
     hostname[len] = '\0';
+}
+
+static int64_t remaining_ms_to(int64_t deadline_us)
+{
+    return (deadline_us - esp_timer_get_time()) / 1000;
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base,
@@ -102,14 +109,15 @@ static void wifi_init_once(const char *screen_name)
 
 /* Association and DHCP are separate failure domains; slow DHCP must not tear
  * down a healthy L2 association. */
-static bool wifi_wait_for_ip(void)
+static bool wifi_wait_for_ip(int64_t deadline_us)
 {
     int64_t attempt_start_us = esp_timer_get_time();
-    int64_t association_deadline_us =
-        attempt_start_us + (int64_t)WIFI_CONNECT_TIMEOUT_MS * 1000;
-    int64_t association_ms =
-        (association_deadline_us - esp_timer_get_time()) / 1000;
-    if (association_ms < 1) association_ms = 1;
+    int64_t association_ms = WIFI_CONNECT_TIMEOUT_MS;
+    int64_t deadline_remaining_ms = remaining_ms_to(deadline_us);
+    if (deadline_remaining_ms <= WIFI_DEADLINE_EPSILON_MS) return false;
+    if (association_ms > deadline_remaining_ms) {
+        association_ms = deadline_remaining_ms;
+    }
 
     EventBits_t bits = xEventGroupWaitBits(wifi_events,
         WIFI_CONNECTED_BIT | WIFI_L2_BIT | WIFI_FAIL_BIT,
@@ -126,6 +134,12 @@ static bool wifi_wait_for_ip(void)
     int64_t remaining_ms =
         (attempt_deadline_us - esp_timer_get_time()) / 1000;
     if (remaining_ms < 1000) remaining_ms = 1000;
+    deadline_remaining_ms = remaining_ms_to(deadline_us);
+    if (deadline_remaining_ms <= 0) return false;
+    /* The global deadline deliberately relaxes the 1000 ms DHCP floor. */
+    if (remaining_ms > deadline_remaining_ms) {
+        remaining_ms = deadline_remaining_ms;
+    }
     ESP_LOGI("hokku", "L2 up, waiting for IP (DHCP, %lld ms budget)...",
              (long long)remaining_ms);
     bits = xEventGroupWaitBits(wifi_events,
@@ -140,15 +154,23 @@ static bool wifi_wait_for_ip(void)
     return false;
 }
 
-static void wifi_disconnect_settle(void)
+static void wifi_disconnect_settle(int64_t deadline_us)
 {
     esp_wifi_disconnect();
-    xEventGroupWaitBits(wifi_events, WIFI_FAIL_BIT,
-                        pdTRUE, pdFALSE, pdMS_TO_TICKS(1000));
-    vTaskDelay(pdMS_TO_TICKS(500));
+    int64_t remaining_ms = remaining_ms_to(deadline_us);
+    if (remaining_ms > 0) {
+        int64_t wait_ms = remaining_ms < 1000 ? remaining_ms : 1000;
+        xEventGroupWaitBits(wifi_events, WIFI_FAIL_BIT,
+                            pdTRUE, pdFALSE, pdMS_TO_TICKS(wait_ms));
+    }
+    remaining_ms = remaining_ms_to(deadline_us);
+    if (remaining_ms > 0) {
+        int64_t delay_ms = remaining_ms < 500 ? remaining_ms : 500;
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
 }
 
-bool wifi_connect(const char *screen_name)
+static bool wifi_connect_once(int64_t deadline_us, const char *screen_name)
 {
     /* Create-once and reuse. Previously allocated a fresh EventGroup on every
      * call, which leaked one per button-press in the first-boot window. */
@@ -213,13 +235,17 @@ bool wifi_connect(const char *screen_name)
                              WIFI_CONNECTED_BIT | WIFI_FAIL_BIT | WIFI_L2_BIT);
         WIFI_TRY(esp_wifi_connect());
 
-        if (wifi_wait_for_ip()) {
+        if (wifi_wait_for_ip(deadline_us)) {
             wifi_ap_record_t ap;
-            if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
-                wifi_channel = ap.primary;
-                memcpy(wifi_bssid, ap.bssid, 6);
-                has_wifi_cache = true;
+            esp_err_t ap_err = esp_wifi_sta_get_ap_info(&ap);
+            if (ap_err != ESP_OK) {
+                ESP_LOGW("hokku", "Association vanished after address acquisition: %s; rejecting round", esp_err_to_name(ap_err));
+                has_wifi_cache = false;
+                return false;
             }
+            wifi_channel = ap.primary;
+            memcpy(wifi_bssid, ap.bssid, 6);
+            has_wifi_cache = true;
             last_wifi_used_cache = wifi_cfg.sta.bssid_set;
             last_wifi_index = (uint8_t)idx;
             return true;
@@ -229,7 +255,7 @@ bool wifi_connect(const char *screen_name)
         if (wifi_cfg.sta.bssid_set) {
             ESP_LOGW("hokku", "Cached-BSSID attempt for net %d failed, retrying with full scan...", idx);
             has_wifi_cache = false;
-            wifi_disconnect_settle();
+            wifi_disconnect_settle(deadline_us);
 
             wifi_cfg.sta.channel = 0;
             wifi_cfg.sta.bssid_set = false;
@@ -238,13 +264,17 @@ bool wifi_connect(const char *screen_name)
                                  WIFI_CONNECTED_BIT | WIFI_FAIL_BIT | WIFI_L2_BIT);
             WIFI_TRY(esp_wifi_connect());
 
-            if (wifi_wait_for_ip()) {
+            if (wifi_wait_for_ip(deadline_us)) {
                 wifi_ap_record_t ap;
-                if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
-                    wifi_channel = ap.primary;
-                    memcpy(wifi_bssid, ap.bssid, 6);
-                    has_wifi_cache = true;
+                esp_err_t ap_err = esp_wifi_sta_get_ap_info(&ap);
+                if (ap_err != ESP_OK) {
+                    ESP_LOGW("hokku", "Association vanished after address acquisition: %s; rejecting round", esp_err_to_name(ap_err));
+                    has_wifi_cache = false;
+                    return false;
                 }
+                wifi_channel = ap.primary;
+                memcpy(wifi_bssid, ap.bssid, 6);
+                has_wifi_cache = true;
                 last_wifi_used_cache = false;
                 last_wifi_index = (uint8_t)idx;
                 return true;
@@ -255,7 +285,38 @@ bool wifi_connect(const char *screen_name)
         int next_idx = (first + step + 1) % 2;
         if (step < 1 && config.wifi_ssid[next_idx][0] != '\0') {
             ESP_LOGW("hokku", "WiFi net %d failed, trying net %d...", idx, next_idx);
-            wifi_disconnect_settle();
+            wifi_disconnect_settle(deadline_us);
+        }
+    }
+
+    return false;
+}
+
+bool wifi_connect(const char *screen_name)
+{
+    static const int retry_delays_ms[] = {1000, 2000, 4000};
+    const int total_attempts = 4;
+    int64_t deadline_us = esp_timer_get_time()
+        + (int64_t)WIFI_LADDER_BUDGET_MS * 1000;
+
+    for (int attempt = 0; attempt < total_attempts; attempt++) {
+        if (attempt > 0
+                && remaining_ms_to(deadline_us) <= WIFI_DEADLINE_EPSILON_MS) {
+            ESP_LOGW("hokku", "WiFi retry budget (75 s) exhausted; skipping remaining rounds");
+            break;
+        }
+        if (wifi_connect_once(deadline_us, screen_name)) return true;
+        if (attempt == total_attempts - 1) break;
+
+        ESP_LOGW("hokku", "WiFi attempt %d/%d failed; retrying in %d ms",
+                 attempt + 1, total_attempts, retry_delays_ms[attempt]);
+        wifi_disconnect_settle(deadline_us);
+
+        int64_t remaining_ms = remaining_ms_to(deadline_us);
+        if (remaining_ms > WIFI_DEADLINE_EPSILON_MS) {
+            int64_t delay_ms = retry_delays_ms[attempt];
+            if (delay_ms > remaining_ms) delay_ms = remaining_ms;
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
         }
     }
 

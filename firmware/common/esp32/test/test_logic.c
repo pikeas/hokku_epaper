@@ -260,6 +260,10 @@ static void reset_mocks(void)
 {
     mock_eg_reset();
     _mock_timer_us = 0;
+    _mock_ap_info_result = -1;
+    memset(&_mock_ap_record, 0, sizeof(_mock_ap_record));
+    _mock_netif_set_hostname_result = ESP_OK;
+    _mock_netif_set_hostname_calls = 0;
 
     has_wifi_cache = false;
     wifi_channel = 0;
@@ -277,34 +281,99 @@ static void reset_mocks(void)
 /* ── wifi.c: two-phase association/DHCP wait ── */
 static void test_wifi_two_phase_wait(void)
 {
+    const int64_t dl = 75000000;  /* 75 s ahead of the mock clock (starts at 0) */
+
     reset_mocks(); mock_eg_push(WIFI_CONNECTED_BIT);
-    CHECK(wifi_wait_for_ip(), "wifi: phase-1 GOT_IP -> connected");
+    CHECK(wifi_wait_for_ip(dl), "wifi: phase-1 GOT_IP -> connected");
 
     reset_mocks(); mock_eg_push(WIFI_FAIL_BIT);
-    CHECK(!wifi_wait_for_ip(), "wifi: phase-1 disconnect -> fail");
+    CHECK(!wifi_wait_for_ip(dl), "wifi: phase-1 disconnect -> fail");
 
     reset_mocks(); mock_eg_push(0);  /* association timeout: no L2, no IP, no fail */
-    CHECK(!wifi_wait_for_ip(), "wifi: no association within budget -> fail");
+    CHECK(!wifi_wait_for_ip(dl), "wifi: no association within budget -> fail");
 
     reset_mocks(); mock_eg_push(WIFI_L2_BIT); mock_eg_push(WIFI_CONNECTED_BIT);
-    CHECK(wifi_wait_for_ip(), "wifi: L2 then DHCP GOT_IP -> connected");
+    CHECK(wifi_wait_for_ip(dl), "wifi: L2 then DHCP GOT_IP -> connected");
 
     reset_mocks(); mock_eg_push(WIFI_L2_BIT); mock_eg_push(0);  /* DHCP times out */
-    CHECK(!wifi_wait_for_ip(), "wifi: L2 up then DHCP timeout -> fail (assoc not torn down early)");
+    CHECK(!wifi_wait_for_ip(dl), "wifi: L2 up then DHCP timeout -> fail (assoc not torn down early)");
 
     reset_mocks(); mock_eg_push(WIFI_L2_BIT); mock_eg_push(WIFI_FAIL_BIT);
-    CHECK(!wifi_wait_for_ip(), "wifi: L2 up then disconnect during DHCP -> fail");
+    CHECK(!wifi_wait_for_ip(dl), "wifi: L2 up then disconnect during DHCP -> fail");
+}
+
+static void test_wifi_deadline_epsilon_guard(void)
+{
+    reset_mocks();
+    mock_eg_push(WIFI_CONNECTED_BIT);        /* would succeed IF a wait happened */
+    CHECK(!wifi_wait_for_ip(_mock_timer_us), /* deadline == now: remaining <= epsilon */
+          "wifi: past-deadline epsilon guard fails without waiting");
+    CHECK(_mock_eg_wait_calls == 0, "wifi: epsilon guard skips the association wait entirely");
+}
+
+/* ── wifi.c: full connect ladder ── */
+static void test_wifi_cache_fallback(void)
+{
+    reset_mocks();
+    has_wifi_cache = true; wifi_channel = 6; last_wifi_index = 0;
+    mock_wifi_set_ap_info(0, 11);            /* AP live on channel 11 */
+    mock_eg_push(WIFI_FAIL_BIT);             /* cached-BSSID attempt fails */
+    mock_eg_push(0);                         /* wifi_disconnect_settle's FAIL-wait */
+    mock_eg_push(WIFI_CONNECTED_BIT);        /* full-scan attempt gets IP */
+
+    CHECK(wifi_connect(config.screen_name), "wifi: cached-BSSID miss falls back to full scan and connects");
+    CHECK(has_wifi_cache && wifi_channel == 11, "wifi: full-scan success re-caches the AP");
+    CHECK(!last_wifi_used_cache, "wifi: fallback success reports cache-not-used");
 }
 
 static void test_wifi_hostname_failure_is_nonfatal(void)
 {
+    reset_mocks();
     wifi_inited = false;
     _mock_netif_set_hostname_result = ESP_FAIL;
-    _mock_netif_set_hostname_calls = 0;
+    mock_wifi_set_ap_info(ESP_OK, 11);
+    mock_eg_push(WIFI_CONNECTED_BIT);
 
-    wifi_init_once("gallery-screen");
+    CHECK(wifi_connect("gallery-screen"),
+          "wifi: hostname-set failure is non-fatal and connect proceeds");
     CHECK(_mock_netif_set_hostname_calls == 1,
-          "wifi: hostname-set failure is non-fatal");
+          "wifi: hostname-set failure test exercises the netif setter");
+}
+
+static void test_wifi_assoc_vanish_clears_cache(void)
+{
+    reset_mocks();
+    has_wifi_cache = true; wifi_channel = 6; last_wifi_index = 0;
+    mock_wifi_set_ap_info(-1, 0);            /* AP-info query fails after GOT_IP */
+    mock_eg_push(WIFI_CONNECTED_BIT);        /* cached attempt appears to get IP... */
+
+    CHECK(!wifi_connect(config.screen_name), "wifi: AP vanished after GOT_IP -> connect fails");
+    CHECK(!has_wifi_cache, "wifi: AP-info failure clears the BSSID cache (forces a scan next time)");
+}
+
+static void test_wifi_ladder_deadline_exhaustion(void)
+{
+    reset_mocks();
+    mock_eg_set_advance_us(40000000);        /* each wait burns 40 s of the 75 s budget */
+    /* queue empty -> every wait times out; the ladder must stop on the deadline,
+     * not run all four rounds. */
+    CHECK(!wifi_connect(config.screen_name), "wifi: dead network fails the connect");
+    CHECK(_mock_eg_wait_calls <= 3,
+          "wifi: 75 s deadline bounds the ladder (far fewer than four full rounds)");
+}
+
+/* wifi_disconnect_settle clamps its FAIL-wait and delay to the shared deadline;
+ * past the deadline it must not wait at all (R2 reviewer: settle-clamp race). */
+static void test_wifi_settle_respects_deadline(void)
+{
+    reset_mocks();
+    _mock_timer_us = 100000;                    /* now = 0.1 s */
+    wifi_disconnect_settle(50000);              /* deadline already 0.05 s in the past */
+    CHECK(_mock_eg_wait_calls == 0, "wifi: settle past the deadline skips its clamped FAIL-wait");
+
+    reset_mocks();
+    wifi_disconnect_settle(75000000);           /* deadline 75 s ahead */
+    CHECK(_mock_eg_wait_calls == 1, "wifi: settle within budget performs its one FAIL-wait");
 }
 
 static void test_wifi_hostname_sanitizer(void)
@@ -362,7 +431,12 @@ int main(void)
     test_log_ring_lifecycle();
     test_config_valid();
     test_wifi_two_phase_wait();
+    test_wifi_deadline_epsilon_guard();
     test_wifi_hostname_failure_is_nonfatal();
+    test_wifi_cache_fallback();
+    test_wifi_assoc_vanish_clears_cache();
+    test_wifi_ladder_deadline_exhaustion();
+    test_wifi_settle_respects_deadline();
     test_wifi_hostname_sanitizer();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return (g_fail > 0) ? 1 : 0;
