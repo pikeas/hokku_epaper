@@ -479,7 +479,7 @@ static int refresh_retry_backoff_seconds(void)
 
 static void perform_refresh(const char *wake_label, int64_t boot_time_us)
 {
-    if (!wifi_connect()) {
+    if (!wifi_connect(config.screen_name)) {
         ESP_LOGE(TAG, "WiFi connect failed");
         schedule_retry_in(refresh_retry_backoff_seconds(), "wifi_connect failed");
         return;

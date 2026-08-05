@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdlib.h>
 
 /* ── ESP-IDF base types (needed throughout, defined here as the first include) ── */
 typedef int32_t esp_err_t;
@@ -13,7 +14,10 @@ typedef int32_t esp_err_t;
 
 static inline const char *esp_err_to_name(esp_err_t e) { (void)e; return "ERR"; }
 
-#define ESP_ERROR_CHECK(x) do { (void)(x); } while(0)
+#define ESP_ERROR_CHECK(x) do {       \
+    esp_err_t __err = (x);            \
+    if (__err != ESP_OK) abort();     \
+} while(0)
 
 /* RTC attributes — no-op on host. */
 #define RTC_NOINIT_ATTR

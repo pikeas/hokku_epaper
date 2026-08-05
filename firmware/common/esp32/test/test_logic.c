@@ -252,6 +252,56 @@ static void test_config_valid(void)
     CHECK(!config_is_valid(), "config: invalid on cfg_ver mismatch");
 }
 
+static void test_wifi_hostname_failure_is_nonfatal(void)
+{
+    wifi_inited = false;
+    _mock_netif_set_hostname_result = ESP_FAIL;
+    _mock_netif_set_hostname_calls = 0;
+
+    wifi_init_once("gallery-screen");
+    CHECK(_mock_netif_set_hostname_calls == 1,
+          "wifi: hostname-set failure is non-fatal");
+}
+
+static void test_wifi_hostname_sanitizer(void)
+{
+    char hostname[WIFI_HOSTNAME_MAX_LEN + 1];
+
+    wifi_sanitize_hostname("gallery-screen-2", hostname);
+    CHECK(strcmp(hostname, "gallery-screen-2") == 0,
+          "wifi: hostname sanitizer preserves RFC-1123 labels");
+
+    wifi_sanitize_hostname("--Gallery room_2--", hostname);
+    CHECK(strcmp(hostname, "Gallery-room-2") == 0,
+          "wifi: hostname sanitizer replaces invalid characters and trims hyphens");
+
+    wifi_sanitize_hostname("---___", hostname);
+    CHECK(hostname[0] == '\0',
+          "wifi: hostname sanitizer leaves an empty result for default-hostname fallback");
+
+    char long_name[80];
+    memset(long_name, 'a', sizeof(long_name) - 1);
+    long_name[sizeof(long_name) - 1] = '\0';
+    wifi_sanitize_hostname(long_name, hostname);
+    CHECK(strlen(hostname) == WIFI_HOSTNAME_MAX_LEN,
+          "wifi: hostname sanitizer caps labels at the IDF 32-character limit");
+
+    memset(long_name, 'a', 31);
+    long_name[31] = '-';
+    memset(long_name + 32, 'b', sizeof(long_name) - 33);
+    long_name[sizeof(long_name) - 1] = '\0';
+    wifi_sanitize_hostname(long_name, hostname);
+    CHECK(strlen(hostname) == 31 && hostname[30] == 'a',
+          "wifi: hostname sanitizer trims a trailing hyphen left by truncation");
+
+    char oversized[MOCK_NETIF_HOSTNAME_MAX_LEN + 2];
+    memset(oversized, 'a', sizeof(oversized) - 1);
+    oversized[sizeof(oversized) - 1] = '\0';
+    CHECK(esp_netif_set_hostname(&_mock_sta_netif, oversized)
+              == ESP_ERR_ESP_NETIF_INVALID_PARAMS,
+          "wifi mock: netif rejects hostnames longer than 32 characters");
+}
+
 int main(void)
 {
     printf("=== test_logic (common/esp32) ===\n\n");
@@ -267,6 +317,8 @@ int main(void)
     test_adopt_cal_seed();
     test_log_ring_lifecycle();
     test_config_valid();
+    test_wifi_hostname_failure_is_nonfatal();
+    test_wifi_hostname_sanitizer();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return (g_fail > 0) ? 1 : 0;
 }

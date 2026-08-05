@@ -12,12 +12,13 @@
  * builder to surface the cache hit-rate to the server. */
 extern bool last_wifi_used_cache;
 
-/* Connect to WiFi. Tries the configured networks in the configured order,
- * applying the persisted BSSID cache for the network that last succeeded and
- * falling back to a full scan on a cache miss. Returns true once an IP is
- * obtained, false if all attempts fail. Non-fatal on driver errors (logs and
- * returns false) so a long-lived awake regime doesn't crash. */
-bool wifi_connect(void);
+/* Connect to WiFi using screen_name as the DHCP hostname. Tries the configured
+ * networks in the configured order, applying the persisted BSSID cache for the
+ * network that last succeeded and falling back to a full scan on a cache miss.
+ * Returns true once an IP is obtained, false if all attempts fail. Non-fatal on
+ * driver errors (logs and returns false) so a long-lived awake regime doesn't
+ * crash. */
+bool wifi_connect(const char *screen_name);
 
 /* Disconnect and stop the WiFi driver. */
 void wifi_shutdown(void);

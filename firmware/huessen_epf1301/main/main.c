@@ -1094,7 +1094,7 @@ static bool perform_refresh(const char *wake_label, int64_t boot_time_us)
     int     cal_seed_n = -1;   /* < 0 until the server's seed headers arrive */
     uint8_t *img = NULL;
 
-    if (!wifi_connect()) {
+    if (!wifi_connect(config.screen_name)) {
         ESP_LOGE(TAG, "WiFi connect failed");
         bool first;
         int backoff = refresh_retry_backoff_seconds(&first);

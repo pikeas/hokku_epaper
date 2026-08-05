@@ -12,6 +12,8 @@
 #include "esp_log.h"
 
 #define WIFI_CONNECT_TIMEOUT_MS  15000  /* per-network attempt; WPA3-SAE assoc + DHCP can be slow on mesh APs */
+/* IDF's esp_netif_set_hostname rejects longer names (private limit in esp_netif_lwip.c). */
+#define WIFI_HOSTNAME_MAX_LEN    32
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
@@ -20,6 +22,25 @@ bool last_wifi_used_cache = false;
 
 static EventGroupHandle_t wifi_events;
 static bool               wifi_inited = false;
+
+static void wifi_sanitize_hostname(const char *screen_name,
+                                   char hostname[WIFI_HOSTNAME_MAX_LEN + 1])
+{
+    size_t len = 0;
+    if (screen_name != NULL) {
+        for (const unsigned char *p = (const unsigned char *)screen_name;
+             *p != '\0' && len < WIFI_HOSTNAME_MAX_LEN; p++) {
+            bool alnum = (*p >= 'a' && *p <= 'z')
+                      || (*p >= 'A' && *p <= 'Z')
+                      || (*p >= '0' && *p <= '9');
+            char c = alnum ? (char)*p : '-';
+            if (c == '-' && len == 0) continue;
+            hostname[len++] = c;
+        }
+    }
+    while (len > 0 && hostname[len - 1] == '-') len--;
+    hostname[len] = '\0';
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
@@ -36,12 +57,22 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     }
 }
 
-static void wifi_init_once(void)
+static void wifi_init_once(const char *screen_name)
 {
     if (wifi_inited) return;
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    char hostname[WIFI_HOSTNAME_MAX_LEN + 1];
+    wifi_sanitize_hostname(screen_name, hostname);
+    if (sta_netif != NULL && hostname[0] != '\0') {
+        esp_err_t err = esp_netif_set_hostname(sta_netif, hostname);
+        if (err != ESP_OK) {
+            ESP_LOGW("hokku", "set_hostname('%s') -> %s (using default)",
+                     hostname, esp_err_to_name(err));
+        }
+    }
+    /* An empty sanitized name deliberately leaves the ESP-IDF default intact. */
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -63,7 +94,7 @@ static void wifi_init_once(void)
     }                                                                           \
 } while (0)
 
-bool wifi_connect(void)
+bool wifi_connect(const char *screen_name)
 {
     /* Create-once and reuse. Previously allocated a fresh EventGroup on every
      * call, which leaked one per button-press in the first-boot window. */
@@ -72,7 +103,7 @@ bool wifi_connect(void)
     } else {
         xEventGroupClearBits(wifi_events, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     }
-    wifi_init_once();
+    wifi_init_once(screen_name);
 
     WIFI_TRY(esp_wifi_set_mode(WIFI_MODE_STA));
     WIFI_TRY(esp_wifi_start());
