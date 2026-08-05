@@ -252,6 +252,50 @@ static void test_config_valid(void)
     CHECK(!config_is_valid(), "config: invalid on cfg_ver mismatch");
 }
 
+/* ═══ Behavioral tests (R7): wifi.c two-phase wait + ladder, net.c 204 +
+ * transfer deadline. These drive the programmable mocks (event-group return
+ * queue, controllable clock, AP-info result, scripted HTTP perform). ═══ */
+
+static void reset_mocks(void)
+{
+    mock_eg_reset();
+    _mock_timer_us = 0;
+
+    has_wifi_cache = false;
+    wifi_channel = 0;
+    last_wifi_index = 0;
+    memset(wifi_bssid, 0, sizeof(wifi_bssid));
+    last_wifi_used_cache = false;
+
+    memset(&config, 0, sizeof(config));
+    config.cfg_ver = CONFIG_VERSION;
+    config.wifi_order = WIFI_ORDER_PRIMARY_FIRST;
+    strcpy(config.wifi_ssid[0], "net0");          /* one primary network */
+    strcpy(config.image_url, "http://h/hokku/screen/");
+}
+
+/* ── wifi.c: two-phase association/DHCP wait ── */
+static void test_wifi_two_phase_wait(void)
+{
+    reset_mocks(); mock_eg_push(WIFI_CONNECTED_BIT);
+    CHECK(wifi_wait_for_ip(), "wifi: phase-1 GOT_IP -> connected");
+
+    reset_mocks(); mock_eg_push(WIFI_FAIL_BIT);
+    CHECK(!wifi_wait_for_ip(), "wifi: phase-1 disconnect -> fail");
+
+    reset_mocks(); mock_eg_push(0);  /* association timeout: no L2, no IP, no fail */
+    CHECK(!wifi_wait_for_ip(), "wifi: no association within budget -> fail");
+
+    reset_mocks(); mock_eg_push(WIFI_L2_BIT); mock_eg_push(WIFI_CONNECTED_BIT);
+    CHECK(wifi_wait_for_ip(), "wifi: L2 then DHCP GOT_IP -> connected");
+
+    reset_mocks(); mock_eg_push(WIFI_L2_BIT); mock_eg_push(0);  /* DHCP times out */
+    CHECK(!wifi_wait_for_ip(), "wifi: L2 up then DHCP timeout -> fail (assoc not torn down early)");
+
+    reset_mocks(); mock_eg_push(WIFI_L2_BIT); mock_eg_push(WIFI_FAIL_BIT);
+    CHECK(!wifi_wait_for_ip(), "wifi: L2 up then disconnect during DHCP -> fail");
+}
+
 static void test_wifi_hostname_failure_is_nonfatal(void)
 {
     wifi_inited = false;
@@ -317,6 +361,7 @@ int main(void)
     test_adopt_cal_seed();
     test_log_ring_lifecycle();
     test_config_valid();
+    test_wifi_two_phase_wait();
     test_wifi_hostname_failure_is_nonfatal();
     test_wifi_hostname_sanitizer();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
