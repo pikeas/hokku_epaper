@@ -92,12 +92,18 @@ void scheduler_observe_sleep(void)
     }
 }
 
-int64_t scheduler_next_sleep_us(int64_t fallback_us)
+int64_t scheduler_next_sleep_us(int64_t fallback_us, int64_t past_due_us)
 {
     if (next_refresh_epoch > 0) {
         time_t now = now_epoch();
         int64_t secs = (now > 0) ? (next_refresh_epoch - (int64_t)now)
                                  : (int64_t)last_sleep_seconds;
+        if (now > 0 && secs <= 0) {
+            /* A refresh can outlive a short server cadence. This is a retry,
+             * not a clean oscillator sample, so do not calibrate it. */
+            last_armed_sleep_s = 0;
+            return past_due_us > 0 ? past_due_us : 1000000LL;
+        }
         if (secs < 1) secs = 1;
         /* Pre-distort the wall interval by the learned drift so the actual sleep
          * lands on the slot. Record what we armed for the next wake's measurement. */

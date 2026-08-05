@@ -169,7 +169,7 @@ static void test_next_sleep_us_calibrated(void)
     /* No drift: arms ~the desired interval and records it. */
     cal_ppm = 0; cal_samples = 0;
     next_refresh_epoch = (int64_t)time(NULL) + 3600;
-    int64_t us = scheduler_next_sleep_us(9999000000LL);
+    int64_t us = scheduler_next_sleep_us(9999000000LL, 60000000LL);
     CHECK(us >= 3590000000LL && us <= 3600000000LL && last_armed_sleep_s >= 3590 &&
           last_armed_sleep_s <= 3600,
           "scheduler: next_sleep_us arms ~desired and records last_armed_sleep_s");
@@ -177,22 +177,30 @@ static void test_next_sleep_us_calibrated(void)
     /* Slow oscillator (+10000 ppm) -> arm LESS than desired. */
     cal_ppm = 10000;
     next_refresh_epoch = (int64_t)time(NULL) + 3600;
-    us = scheduler_next_sleep_us(9999000000LL);
+    us = scheduler_next_sleep_us(9999000000LL, 60000000LL);
     CHECK(us >= 3554000000LL && us <= 3566000000LL,
           "scheduler: next_sleep_us arms less for a slow clock");
 
     /* Tick-deadline (negative) -> not calibrated, last_armed cleared. */
     cal_ppm = 10000;
     next_refresh_epoch = -(esp_timer_get_time() + 5000000LL);
-    us = scheduler_next_sleep_us(9999000000LL);
+    us = scheduler_next_sleep_us(9999000000LL, 60000000LL);
     CHECK(us > 0 && us <= 5000000LL && last_armed_sleep_s == 0,
           "scheduler: next_sleep_us honours a tick deadline without calibrating");
 
     /* Unscheduled (zero) -> board fallback, last_armed cleared. */
     next_refresh_epoch = 0;
-    us = scheduler_next_sleep_us(7200000000LL);
+    us = scheduler_next_sleep_us(7200000000LL, 60000000LL);
     CHECK(us == 7200000000LL && last_armed_sleep_s == 0,
           "scheduler: next_sleep_us returns the board fallback when unscheduled");
+
+    /* A valid absolute schedule can expire while a slow display cycle finishes.
+     * Use the board's retry interval, not a 1 s clamp. */
+    next_refresh_epoch = (int64_t)time(NULL) - 1;
+    last_armed_sleep_s = 123;
+    us = scheduler_next_sleep_us(7200000000LL, 60000000LL);
+    CHECK(us == 60000000LL && last_armed_sleep_s == 0,
+          "scheduler: past-due schedule uses the board retry without calibration");
 }
 
 static void test_adopt_cal_seed(void)

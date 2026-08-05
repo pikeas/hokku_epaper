@@ -600,7 +600,8 @@ static void enter_deep_sleep(int64_t sleep_us)
  * armed for the next cycle's measurement. */
 static void schedule_and_sleep(void)
 {
-    int64_t sleep_us = scheduler_next_sleep_us((int64_t)SLEEP_FALLBACK_S * 1000000LL);
+    int64_t sleep_us = scheduler_next_sleep_us(
+        (int64_t)SLEEP_FALLBACK_S * 1000000LL, 1000000LL);
     enter_deep_sleep(sleep_us);
 }
 

@@ -54,8 +54,9 @@ void scheduler_observe_sleep(void);
 /* Microseconds to arm for the next deep sleep, derived from next_refresh_epoch
  * (all three states) with drift calibration applied to a normal scheduled sleep.
  * Records last_armed_sleep_s so the next wake can measure drift. fallback_us is
- * the board's no-schedule default (next_refresh_epoch == 0). */
-int64_t scheduler_next_sleep_us(int64_t fallback_us);
+ * the board's no-schedule default (next_refresh_epoch == 0); past_due_us is the
+ * board's positive retry interval when a valid epoch schedule expired mid-cycle. */
+int64_t scheduler_next_sleep_us(int64_t fallback_us, int64_t past_due_us);
 
 /* Adopt a server-provided calibration seed into cal_ppm when this device has no
  * calibration of its own yet and the server's mean is backed by enough samples

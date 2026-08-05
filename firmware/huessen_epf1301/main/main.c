@@ -1318,14 +1318,15 @@ static void regime_battery_idle(int64_t boot_time_us)
      * refresh (or the user plugs USB / presses a button, which wakes
      * us via EXT1).
      *
-     * perform_refresh always sets next_refresh_epoch to a future value
+     * perform_refresh normally sets next_refresh_epoch to a future value
      * on this boot (either from the server's schedule or via
-     * schedule_retry_in on failure). The shared scheduler derives the
-     * interval from the anchor (all three states), pre-distorts it by the
-     * learned oscillator drift so the wake lands on the slot, and records
-     * what it armed for the next cycle's measurement. SLEEP_FALLBACK_3H_US
-     * is the no-schedule fallback (never successfully synced). */
-    int64_t sleep_us = scheduler_next_sleep_us(SLEEP_FALLBACK_3H_US);
+     * schedule_retry_in on failure). Past-due is still reachable: the deadline
+     * is set before the ~19 s paint, so a cycle can outlive a short cadence.
+     * The shared scheduler preserves our 60 s retry for that case while still
+     * applying oscillator calibration to normal future schedules. */
+    int64_t sleep_us = scheduler_next_sleep_us(
+        SLEEP_FALLBACK_3H_US,
+        (int64_t)REFRESH_RETRY_SECONDS * 1000000LL);
     enter_deep_sleep(sleep_us);
     /* Never returns */
 }
@@ -1479,6 +1480,7 @@ void app_main(void)
                      "Run hokku-setup to\nreconfigure.",
                      CONFIG_VERSION, config.cfg_ver);
             display_message(msg);
+            next_refresh_epoch = 0;  /* invalid config invalidates the schedule */
             regime_battery_idle(boot_time);
             return;
         }
@@ -1490,6 +1492,7 @@ void app_main(void)
                 "hokku-setup to\n"
                 "configure."
             );
+            next_refresh_epoch = 0;  /* invalid config invalidates the schedule */
             regime_battery_idle(boot_time);
             return;
         }
