@@ -259,6 +259,7 @@ static void test_config_valid(void)
 static void reset_mocks(void)
 {
     mock_eg_reset();
+    mock_http_reset();
     _mock_timer_us = 0;
     _mock_ap_info_result = -1;
     memset(&_mock_ap_record, 0, sizeof(_mock_ap_record));
@@ -362,6 +363,65 @@ static void test_wifi_ladder_deadline_exhaustion(void)
           "wifi: 75 s deadline bounds the ladder (far fewer than four full rounds)");
 }
 
+/* ── net.c: response-header capture + transfer deadline (handler-direct) ── */
+static void test_net_header_capture(void)
+{
+    reset_mocks();
+    http_download_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    esp_http_client_event_t evt = { .client = (void *)1, .user_data = &ctx,
+                                     .event_id = HTTP_EVENT_ON_HEADER };
+
+    evt.header_key = (char *)"X-Sleep-Seconds"; evt.header_value = (char *)"120";
+    http_event_handler(&evt);
+    CHECK(strcmp(ctx.sleep_seconds_hdr, "120") == 0, "net: captures X-Sleep-Seconds header");
+
+    evt.header_key = (char *)"X-Firmware-Update"; evt.header_value = (char *)"1.2.99";
+    http_event_handler(&evt);
+    CHECK(strcmp(ctx.fw_update_hdr, "1.2.99") == 0, "net: captures X-Firmware-Update header");
+    CHECK(_mock_http.close_calls == 0, "net: no deadline close while inside the budget");
+}
+
+static void test_net_transfer_deadline(void)
+{
+    reset_mocks();
+    http_download_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    _mock_timer_us = 91000000;
+    esp_http_client_event_t evt = { .client = (void *)1, .user_data = &ctx,
+                                     .event_id = HTTP_EVENT_ON_HEADER };
+
+    http_event_handler(&evt);
+    CHECK(ctx.deadline_hit, "net: an event past the 90 s deadline sets deadline_hit");
+    CHECK(_mock_http.close_calls == 1, "net: overdue event closes the client");
+    http_event_handler(&evt);
+    CHECK(_mock_http.close_calls == 2, "net: closes on every overdue event (re-bounds retries)");
+    CHECK(ctx.deadline_hit, "net: deadline flag latches across overdue events");
+}
+
+static void test_net_completed_but_overdue_discarded(void)
+{
+    reset_mocks();
+    s_log_ring_head = 0; s_log_ring_used = 0;
+    hokku_log_init();
+    call_log("overdue");
+    size_t used_before = s_log_ring_used;
+
+    uint8_t payload[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint8_t buf[8] = {0};
+    mock_http_set_advance_us(100000000);
+    mock_http_push_event(HTTP_EVENT_ON_CONNECTED, NULL, NULL, NULL, 0);
+    mock_http_push_data(payload, sizeof(payload));
+    mock_http_set_result(ESP_OK, 200);
+
+    int status = 0;
+    hokku_fetch_out_t out = { .out_http_status = &status };
+    bool r = hokku_http_fetch_image(buf, sizeof(buf), "http://h/", "n", "M", "{}", "b", &out);
+    CHECK(!r, "net: completed-but-overdue 200 is discarded (deadline_hit folds to failure)");
+    CHECK(status == 200, "net: overdue transfer still surfaces the server's 200");
+    CHECK(s_log_ring_used == used_before, "net: overdue transfer does NOT reset the log ring");
+}
+
 /* wifi_disconnect_settle clamps its FAIL-wait and delay to the shared deadline;
  * past the deadline it must not wait at all (R2 reviewer: settle-clamp race). */
 static void test_wifi_settle_respects_deadline(void)
@@ -436,6 +496,9 @@ int main(void)
     test_wifi_cache_fallback();
     test_wifi_assoc_vanish_clears_cache();
     test_wifi_ladder_deadline_exhaustion();
+    test_net_header_capture();
+    test_net_transfer_deadline();
+    test_net_completed_but_overdue_discarded();
     test_wifi_settle_respects_deadline();
     test_wifi_hostname_sanitizer();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
