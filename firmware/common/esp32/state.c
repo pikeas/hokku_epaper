@@ -16,6 +16,7 @@ RTC_NOINIT_ATTR uint8_t  last_wifi_index;
 RTC_NOINIT_ATTR uint16_t last_battery_mv;
 
 RTC_NOINIT_ATTR int32_t  last_sleep_seconds;
+RTC_NOINIT_ATTR char     last_content_id[16];
 RTC_NOINIT_ATTR int64_t  next_refresh_epoch;
 RTC_NOINIT_ATTR int64_t  pre_sleep_server_epoch;
 RTC_NOINIT_ATTR int32_t  last_sleep_err_s;
@@ -47,6 +48,7 @@ bool hokku_state_validate(void)
         last_wifi_index = 0;
         last_battery_mv = 0;
         last_sleep_seconds = 0;
+        last_content_id[0] = '\0';
         next_refresh_epoch = 0;
         pre_sleep_server_epoch = 0;
         last_sleep_err_s = 0;

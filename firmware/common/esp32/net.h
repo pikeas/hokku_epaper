@@ -33,6 +33,8 @@ typedef struct {
      * it to a negative sentinel), so the board can decide whether to adopt. */
     int32_t *out_cal_seed_ppm;    /* X-Sleep-Cal-PPM (server's pinned long-term mean) */
     int     *out_cal_seed_n;      /* X-Sleep-Cal-N (measurements behind the mean) */
+    char    *out_content_id;      /* response X-Content-Id (empty if none) */
+    size_t   content_id_buflen;   /* size of out_content_id */
 } hokku_fetch_out_t;
 
 /* Format this device's WiFi STA MAC as lowercase "aa:bb:cc:dd:ee:ff" into out
@@ -42,10 +44,13 @@ void hokku_screen_mac_str(char *out, size_t len);
 
 /* Fetch the screen image into buf (capacity = expect_bytes; caller owns it).
  * frame_state is the caller-built X-Frame-State JSON. fw_build is the compile
- * stamp (X-Firmware-Build); the version comes from the app descriptor. On a 200
- * with exactly expect_bytes received, resets the log ring and returns true;
- * otherwise returns false (buf left untouched for the caller to free). */
+ * stamp (X-Firmware-Build); the version comes from the app descriptor.
+ * if_content_id is the X-Content-Id request header for skip-refresh; NULL or
+ * empty means don't send it. On a 200 with exactly expect_bytes received,
+ * resets the log ring and returns true; otherwise returns false (buf left
+ * untouched for the caller to free). */
 bool hokku_http_fetch_image(uint8_t *buf, size_t expect_bytes,
                             const char *url, const char *screen_name,
                             const char *screen_model, const char *frame_state,
-                            const char *fw_build, hokku_fetch_out_t *out);
+                            const char *fw_build, const char *if_content_id,
+                            hokku_fetch_out_t *out);

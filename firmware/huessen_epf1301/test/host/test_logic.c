@@ -20,6 +20,8 @@
 #include <stdbool.h>
 #include <time.h>
 
+#define CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE 1
+
 /* ── Mock headers (included before #define static so their own
  *    static/static-inline functions are compiled with proper storage class) ── */
 #include "mocks/freertos/FreeRTOS.h"
@@ -339,6 +341,128 @@ static void test_logger_ring_lifecycle(void)
     CHECK(n == 0 && s_log_ring_used == 0, "logger: reset clears the ring after upload");
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ *  perform_refresh: HTTP 204 "content unchanged" board branch (R5/R7)
+ *
+ *  Drives the whole board refresh with a reachable server that returns 204:
+ *  wifi connects, the download reports 204 (no image), no OTA is armed. The
+ *  204 branch must reset the outage streak, keep the schedule, paint nothing,
+ *  and report NOT painted — so app_main's `if (refreshed)
+ *  ota_mark_valid_if_pending()` gate never validates a slot on a no-op.
+ * ═══════════════════════════════════════════════════════════════════════ */
+static void test_perform_refresh_204_not_painted(void)
+{
+    mock_eg_reset();
+    mock_http_reset();
+    _mock_timer_us = 0;
+
+    memset(&config, 0, sizeof(config));
+    config.cfg_ver = CONFIG_VERSION;
+    strcpy(config.wifi_ssid[0], "net0");
+    strcpy(config.image_url, "http://h/hokku/screen/");
+    has_wifi_cache = false;
+
+    consecutive_refresh_failures = 5;            /* a pre-existing outage streak */
+    strcpy(last_content_id, "oldid0000000");
+
+    /* Production calls this before perform_refresh on every timer wake. A 204
+     * must not prevent the just-completed sleep from becoming a calibration
+     * sample merely because no repaint follows. */
+    last_sleep_mode = LAST_SLEEP_MODE_TIMER_WAKE;
+    last_sleep_seconds = 43200;
+    last_armed_sleep_s = 43200;
+    pre_sleep_server_epoch = (int64_t)time(NULL) - 43632;
+    cal_ppm = 0;
+    cal_samples = 0;
+    scheduler_observe_sleep();
+    CHECK(cal_samples == 1 && cal_ppm >= 9900 && cal_ppm <= 10100,
+          "huessen: timer wake learns sleep calibration before a 204 refresh");
+
+    mock_wifi_set_ap_info(0, 6);                 /* wifi_connect -> success */
+    mock_eg_push(WIFI_CONNECTED_BIT);
+
+    mock_http_push_event(HTTP_EVENT_ON_CONNECTED, NULL, NULL, NULL, 0);
+    mock_http_push_header((char *)"X-Sleep-Seconds", (char *)"300");
+    mock_http_push_header((char *)"X-Server-Time-Epoch", (char *)"1700000000");
+    mock_http_set_result(ESP_OK, 204);           /* content unchanged */
+
+    bool painted = perform_refresh("timer", 0);
+    CHECK(!painted, "huessen: 204 reports NOT painted (app_main won't validate a pending OTA)");
+    CHECK(consecutive_refresh_failures == 0, "huessen: 204 clears the outage streak (server reachable)");
+    CHECK(strcmp(last_content_id, "oldid0000000") == 0,
+          "huessen: 204 leaves the stored content id unchanged");
+    CHECK(cal_samples == 1 && cal_ppm >= 9900 && cal_ppm <= 10100,
+          "huessen: 204 cycle preserves the newly learned calibration sample");
+}
+
+static void test_perform_refresh_204_adopts_cal_seed(void)
+{
+    mock_eg_reset();
+    mock_http_reset();
+    _mock_timer_us = 0;
+
+    memset(&config, 0, sizeof(config));
+    config.cfg_ver = CONFIG_VERSION;
+    strcpy(config.wifi_ssid[0], "net0");
+    strcpy(config.image_url, "http://h/hokku/screen/");
+    has_wifi_cache = false;
+    cal_ppm = 0;
+    cal_samples = 0;
+
+    mock_wifi_set_ap_info(0, 6);
+    mock_eg_push(WIFI_CONNECTED_BIT);
+    mock_http_push_event(HTTP_EVENT_ON_CONNECTED, NULL, NULL, NULL, 0);
+    mock_http_push_header((char *)"X-Sleep-Seconds", (char *)"300");
+    mock_http_push_header((char *)"X-Server-Time-Epoch", (char *)"1700000000");
+    mock_http_push_header((char *)"X-Sleep-Cal-PPM", (char *)"8000");
+    mock_http_push_header((char *)"X-Sleep-Cal-N", (char *)"5");
+    mock_http_set_result(ESP_OK, 204);
+
+    bool painted = perform_refresh("timer", 0);
+    CHECK(!painted, "huessen: seeded 204 still reports NOT painted");
+    CHECK(cal_ppm == 8000 && cal_samples == 1,
+          "huessen: uncalibrated device adopts a well-backed seed from a 204");
+}
+
+static void test_pending_verify_forces_200_paint_and_validates(void)
+{
+    mock_eg_reset();
+    mock_http_reset();
+    mock_ota_reset();
+    _mock_timer_us = 0;
+
+    memset(&config, 0, sizeof(config));
+    config.cfg_ver = CONFIG_VERSION;
+    strcpy(config.wifi_ssid[0], "net0");
+    strcpy(config.image_url, "http://h/hokku/screen/");
+    has_wifi_cache = false;
+    strcpy(last_content_id, "oldid0000000");
+    mock_ota_set_running_state(ESP_OTA_IMG_PENDING_VERIFY);
+
+    mock_wifi_set_ap_info(ESP_OK, 6);
+    mock_eg_push(WIFI_CONNECTED_BIT);
+
+    uint8_t *payload = malloc(TOTAL_IMAGE_SIZE);
+    CHECK(payload != NULL, "huessen: allocates pending-verify test image");
+    if (payload == NULL) return;
+    memset(payload, COLOR_WHITE_BYTE, TOTAL_IMAGE_SIZE);
+    mock_http_push_event(HTTP_EVENT_ON_CONNECTED, NULL, NULL, NULL, 0);
+    mock_http_push_header((char *)"X-Sleep-Seconds", (char *)"300");
+    mock_http_push_header((char *)"X-Server-Time-Epoch", (char *)"1700000000");
+    mock_http_push_header((char *)"X-Content-Id", (char *)"newid0000000");
+    mock_http_push_data(payload, TOTAL_IMAGE_SIZE);
+    mock_http_set_result(ESP_OK, 200);
+
+    bool painted = perform_refresh("timer", 0);
+    CHECK(!_mock_http.content_id_header_seen,
+          "huessen: pending-verify fetch suppresses the stored X-Content-Id");
+    CHECK(painted, "huessen: pending-verify 200 response paints successfully");
+    if (painted) ota_mark_valid_if_pending();
+    CHECK(_mock_ota_mark_valid_calls == 1,
+          "huessen: successful pending-verify paint validates the OTA slot");
+    free(payload);
+}
+
 int main(void)
 {
     /* All mock GPIO pins start at 0 (LOW). Set defaults appropriate for the
@@ -377,6 +501,11 @@ int main(void)
 
     /* Logger (single RTC ring) */
     test_logger_ring_lifecycle();
+
+    /* perform_refresh 204 board branch */
+    test_perform_refresh_204_not_painted();
+    test_perform_refresh_204_adopts_cal_seed();
+    test_pending_verify_forces_200_paint_and_validates();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return (g_fail > 0) ? 1 : 0;

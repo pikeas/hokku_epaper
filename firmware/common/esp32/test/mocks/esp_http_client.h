@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 #include "esp_timer.h"   /* _mock_timer_us, so a scripted transfer can age past its deadline */
 
 typedef void *esp_http_client_handle_t;
@@ -70,6 +71,7 @@ static struct {
     int     close_calls;
     int64_t advance_us;       /* added to the mock clock before each replayed event */
     bool    disable_auto_redirect_seen;
+    bool    content_id_header_seen;
 } _mock_http;
 
 static inline void mock_http_reset(void) {
@@ -81,6 +83,7 @@ static inline void mock_http_reset(void) {
     _mock_http.close_calls = 0;
     _mock_http.advance_us = 0;
     _mock_http.disable_auto_redirect_seen = false;
+    _mock_http.content_id_header_seen = false;
 }
 static inline void mock_http_set_advance_us(int64_t us) { _mock_http.advance_us = us; }
 static inline void mock_http_set_result(int perform_result, int status_code) {
@@ -109,7 +112,10 @@ static inline esp_http_client_handle_t esp_http_client_init(const esp_http_clien
     return (void *)1;
 }
 static inline int esp_http_client_set_header(esp_http_client_handle_t c, const char *k, const char *v) {
-    (void)c; (void)k; (void)v; return 0;
+    (void)c; (void)v;
+    if (k != NULL && strcmp(k, "X-Content-Id") == 0)
+        _mock_http.content_id_header_seen = true;
+    return 0;
 }
 static inline int esp_http_client_perform(esp_http_client_handle_t c) {
     if (_mock_http.handler) {

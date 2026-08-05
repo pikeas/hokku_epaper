@@ -27,6 +27,7 @@ typedef struct {
      * way — esp_http_client_get_header() reads REQUEST headers, not response.) */
     char     sleep_seconds_hdr[32];
     char     server_epoch_hdr[32];
+    char     content_id_hdr[16];
     /* X-Firmware-Update: <version> — present when the server wants this device
      * to OTA. The body (image) is ignored when set. */
     char     fw_update_hdr[48];
@@ -63,6 +64,7 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
             ctx->received = 0;
             ctx->sleep_seconds_hdr[0] = '\0';
             ctx->server_epoch_hdr[0]  = '\0';
+            ctx->content_id_hdr[0]    = '\0';
             ctx->fw_update_hdr[0]     = '\0';
             ctx->cal_ppm_hdr[0]       = '\0';
             ctx->cal_n_hdr[0]         = '\0';
@@ -80,6 +82,10 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
                     strncpy(ctx->server_epoch_hdr, evt->header_value,
                             sizeof(ctx->server_epoch_hdr) - 1);
                     ctx->server_epoch_hdr[sizeof(ctx->server_epoch_hdr) - 1] = '\0';
+                } else if (strcasecmp(evt->header_key, "X-Content-Id") == 0) {
+                    strncpy(ctx->content_id_hdr, evt->header_value,
+                            sizeof(ctx->content_id_hdr) - 1);
+                    ctx->content_id_hdr[sizeof(ctx->content_id_hdr) - 1] = '\0';
                 } else if (strcasecmp(evt->header_key, "X-Firmware-Update") == 0) {
                     strncpy(ctx->fw_update_hdr, evt->header_value,
                             sizeof(ctx->fw_update_hdr) - 1);
@@ -125,7 +131,8 @@ void hokku_screen_mac_str(char *out, size_t len)
 bool hokku_http_fetch_image(uint8_t *buf, size_t expect_bytes,
                             const char *url, const char *screen_name,
                             const char *screen_model, const char *frame_state,
-                            const char *fw_build, hokku_fetch_out_t *out)
+                            const char *fw_build, const char *if_content_id,
+                            hokku_fetch_out_t *out)
 {
     http_download_ctx_t ctx = {
         .buf = buf,
@@ -174,6 +181,8 @@ bool hokku_http_fetch_image(uint8_t *buf, size_t expect_bytes,
     const char *fw_ver = (app && app->version[0]) ? app->version : "unknown";
     esp_http_client_set_header(client, "X-Firmware-Version", fw_ver);
     esp_http_client_set_header(client, "X-Firmware-Build", fw_build);
+    if (if_content_id != NULL && if_content_id[0] != '\0')
+        esp_http_client_set_header(client, "X-Content-Id", if_content_id);
 
     /* Attach the log ring (carry + active, joined) as the POST body. Size the
      * receiving buffer to the max joined length so nothing is truncated.
@@ -245,7 +254,7 @@ bool hokku_http_fetch_image(uint8_t *buf, size_t expect_bytes,
         }
     }
 
-    /* Surface any OTA-update request (server sends it only on the 200). */
+    /* Surface any OTA-update request before status-specific handling. */
     if (out && out->out_fw_update && out->fw_update_buflen > 0) {
         out->out_fw_update[0] = '\0';
         if (ctx.fw_update_hdr[0] != '\0') {
@@ -254,11 +263,27 @@ bool hokku_http_fetch_image(uint8_t *buf, size_t expect_bytes,
             ESP_LOGI("hokku", "X-Firmware-Update: %s (server requested OTA)", out->out_fw_update);
         }
     }
+    if (out && out->out_content_id && out->content_id_buflen > 0) {
+        out->out_content_id[0] = '\0';
+        strncpy(out->out_content_id, ctx.content_id_hdr, out->content_id_buflen - 1);
+        out->out_content_id[out->content_id_buflen - 1] = '\0';
+    }
 
     esp_http_client_cleanup(client);
     free(log_body);
 
-    if (out && out->out_http_status) *out->out_http_status = status;
+    /* A 204 is actionable only when perform() stayed transport-clean. Keep
+     * other status codes available for existing diagnostics/error handling. */
+    if (out && out->out_http_status)
+        *out->out_http_status = (err != ESP_OK && status == 204) ? 0 : status;
+
+    if (err == ESP_OK && status == 204) {
+        /* Not a complete image; bool contract unchanged. Logged by the board's
+         * 204 branch AFTER its ring reset so the line survives into the next
+         * POSTed ring (a pre-reset log is wiped before the server ever sees it —
+         * same reason the success line below sits after hokku_log_reset). */
+        return false;
+    }
 
     if (err != ESP_OK || status != 200) {
         ESP_LOGE("hokku", "HTTP download failed: err=%s status=%d", esp_err_to_name(err), status);

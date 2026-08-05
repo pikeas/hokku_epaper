@@ -376,9 +376,13 @@ static void test_net_header_capture(void)
 {
     reset_mocks();
     http_download_ctx_t ctx;
-    memset(&ctx, 0, sizeof(ctx));
+    memset(&ctx, 0, sizeof(ctx));                 /* transfer_start_us = 0, clock = 0 */
     esp_http_client_event_t evt = { .client = (void *)1, .user_data = &ctx,
                                      .event_id = HTTP_EVENT_ON_HEADER };
+
+    evt.header_key = (char *)"X-Content-Id"; evt.header_value = (char *)"cafe1234abcd";
+    http_event_handler(&evt);
+    CHECK(strcmp(ctx.content_id_hdr, "cafe1234abcd") == 0, "net: captures X-Content-Id header");
 
     evt.header_key = (char *)"X-Sleep-Seconds"; evt.header_value = (char *)"120";
     http_event_handler(&evt);
@@ -394,10 +398,10 @@ static void test_net_transfer_deadline(void)
 {
     reset_mocks();
     http_download_ctx_t ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    _mock_timer_us = 91000000;
+    memset(&ctx, 0, sizeof(ctx));                 /* transfer_start_us = 0 */
+    _mock_timer_us = 91000000;                    /* 91 s > 90 s image deadline */
     esp_http_client_event_t evt = { .client = (void *)1, .user_data = &ctx,
-                                     .event_id = HTTP_EVENT_ON_HEADER };
+                                     .event_id = HTTP_EVENT_ON_HEADER };  /* NULL key: no capture */
 
     http_event_handler(&evt);
     CHECK(ctx.deadline_hit, "net: an event past the 90 s deadline sets deadline_hit");
@@ -407,6 +411,64 @@ static void test_net_transfer_deadline(void)
     CHECK(ctx.deadline_hit, "net: deadline flag latches across overdue events");
 }
 
+/* ── net.c: hokku_http_fetch_image status contract ── */
+static void test_net_204_skip(void)
+{
+    reset_mocks();
+    s_log_ring_head = 0; s_log_ring_used = 0;
+    hokku_log_init();
+    call_log("ride-along");                       /* rode the request as the POST body */
+    size_t used_before = s_log_ring_used;
+
+    mock_http_push_event(HTTP_EVENT_ON_CONNECTED, NULL, NULL, NULL, 0);
+    mock_http_push_header((char *)"X-Sleep-Seconds", (char *)"300");
+    mock_http_push_header((char *)"X-Content-Id", (char *)"aabbccdd1122");
+    mock_http_set_result(ESP_OK, 204);
+
+    uint8_t buf[8];
+    int32_t sleep_s = 0; int64_t epoch = 0; int status = 0; char cid[16] = {0};
+    hokku_fetch_out_t out = { .out_sleep_seconds = &sleep_s, .out_server_epoch = &epoch,
+                              .out_http_status = &status, .out_content_id = cid,
+                              .content_id_buflen = sizeof(cid) };
+
+    bool r = hokku_http_fetch_image(buf, sizeof(buf), "http://h/", "name", "MODEL",
+                                    "{}", "build", NULL, &out);
+    CHECK(!r, "net: 204 returns false (a no-op never satisfies pending-OTA verification)");
+    CHECK(status == 204, "net: 204 surfaces out_http_status = 204");
+    CHECK(sleep_s == 300, "net: 204 still applies X-Sleep-Seconds (server owns cadence)");
+    CHECK(strcmp(cid, "aabbccdd1122") == 0, "net: 204 captures X-Content-Id");
+    CHECK(s_log_ring_used == used_before, "net: 204 does NOT reset the log ring (Huessen's branch owns that)");
+}
+
+static void test_net_200_paint(void)
+{
+    reset_mocks();
+    s_log_ring_head = 0; s_log_ring_used = 0;
+    hokku_log_init();
+    call_log("pre-200");
+
+    uint8_t payload[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint8_t buf[8] = {0};
+    mock_http_push_event(HTTP_EVENT_ON_CONNECTED, NULL, NULL, NULL, 0);
+    mock_http_push_header((char *)"X-Content-Id", (char *)"deadbeef0001");
+    mock_http_push_data(payload, sizeof(payload));
+    mock_http_set_result(ESP_OK, 200);
+
+    int status = 0; char cid[16] = {0};
+    hokku_fetch_out_t out = { .out_http_status = &status, .out_content_id = cid,
+                              .content_id_buflen = sizeof(cid) };
+
+    bool r = hokku_http_fetch_image(buf, sizeof(buf), "http://h/", "n", "M", "{}", "b", NULL, &out);
+    CHECK(r, "net: 200 with exactly expect_bytes returns true");
+    CHECK(status == 200, "net: 200 surfaces out_http_status = 200");
+    CHECK(memcmp(buf, payload, sizeof(payload)) == 0, "net: 200 delivers the image bytes into buf");
+    CHECK(strcmp(cid, "deadbeef0001") == 0, "net: 200 captures X-Content-Id");
+    CHECK(s_log_ring_used == 0, "net: 200 resets the log ring");
+}
+
+/* perform() completes a full 200 body but the transfer ran past the 90 s
+ * deadline: the post-perform deadline_hit fold must force failure and skip the
+ * ring reset, discarding the completed-but-overdue image (R6 reviewer). */
 static void test_net_completed_but_overdue_discarded(void)
 {
     reset_mocks();
@@ -417,14 +479,14 @@ static void test_net_completed_but_overdue_discarded(void)
 
     uint8_t payload[8] = {1, 2, 3, 4, 5, 6, 7, 8};
     uint8_t buf[8] = {0};
-    mock_http_set_advance_us(100000000);
+    mock_http_set_advance_us(100000000);   /* +100 s per event -> trips the 90 s deadline mid-replay */
     mock_http_push_event(HTTP_EVENT_ON_CONNECTED, NULL, NULL, NULL, 0);
-    mock_http_push_data(payload, sizeof(payload));
-    mock_http_set_result(ESP_OK, 200);
+    mock_http_push_data(payload, sizeof(payload));   /* full body still delivered */
+    mock_http_set_result(ESP_OK, 200);     /* server returned a clean 200 */
 
     int status = 0;
     hokku_fetch_out_t out = { .out_http_status = &status };
-    bool r = hokku_http_fetch_image(buf, sizeof(buf), "http://h/", "n", "M", "{}", "b", &out);
+    bool r = hokku_http_fetch_image(buf, sizeof(buf), "http://h/", "n", "M", "{}", "b", NULL, &out);
     CHECK(!r, "net: completed-but-overdue 200 is discarded (deadline_hit folds to failure)");
     CHECK(status == 200, "net: overdue transfer still surfaces the server's 200");
     CHECK(s_log_ring_used == used_before, "net: overdue transfer does NOT reset the log ring");
@@ -483,6 +545,31 @@ static void test_wifi_hostname_sanitizer(void)
           "wifi mock: netif rejects hostnames longer than 32 characters");
 }
 
+/* A deadline can fold an otherwise parsed 204 into ESP_FAIL. That response
+ * must not export an actionable 204 to the board's healthy-skip branch. */
+static void test_net_overdue_204_not_healthy(void)
+{
+    reset_mocks();
+    s_log_ring_head = 0; s_log_ring_used = 0;
+    hokku_log_init();
+    call_log("overdue-204");
+    size_t used_before = s_log_ring_used;
+
+    mock_http_set_advance_us(100000000);
+    mock_http_push_event(HTTP_EVENT_ON_CONNECTED, NULL, NULL, NULL, 0);
+    mock_http_push_header((char *)"X-Sleep-Seconds", (char *)"300");
+    mock_http_set_result(ESP_OK, 204);
+
+    uint8_t buf[8];
+    int status = -1;
+    hokku_fetch_out_t out = { .out_http_status = &status };
+    bool r = hokku_http_fetch_image(buf, sizeof(buf), "http://h/", "n", "M",
+                                    "{}", "b", NULL, &out);
+    CHECK(!r, "net: overdue 204 returns failure");
+    CHECK(status != 204, "net: transport-errored 204 is not exported as a healthy skip");
+    CHECK(s_log_ring_used == used_before, "net: overdue 204 does NOT reset the log ring");
+}
+
 int main(void)
 {
     printf("=== test_logic (common/esp32) ===\n\n");
@@ -506,7 +593,10 @@ int main(void)
     test_wifi_ladder_deadline_exhaustion();
     test_net_header_capture();
     test_net_transfer_deadline();
+    test_net_204_skip();
+    test_net_200_paint();
     test_net_completed_but_overdue_discarded();
+    test_net_overdue_204_not_healthy();
     test_wifi_settle_respects_deadline();
     test_wifi_hostname_sanitizer();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);

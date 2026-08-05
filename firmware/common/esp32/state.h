@@ -16,7 +16,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define RTC_MAGIC            0x484F4B55  /* "HOKU" — validates RTC memory after POR / flash */
+#define RTC_MAGIC            0x484F4B34  /* "HOK4" — combined content-id + sleep-cal RTC layout */
 #define MAX_SPURIOUS_RESETS  3           /* cap on repeated spurious deep-sleep wakes */
 #define LOG_RING_SIZE        6144        /* log ring buffer size (RTC slow memory) */
 
@@ -55,6 +55,13 @@ extern uint16_t last_battery_mv;
 /* Last server-provided sleep interval (seconds); fallback if the next boot's
  * download fails. */
 extern int32_t  last_sleep_seconds;
+
+/* Content id of the image currently on glass (server's X-Content-Id, 12 hex).
+ * Sent back on timer wakes so the server can answer 204 = skip the download and
+ * the ~19s repaint; empty = unknown -> always full refresh. Paint success is
+ * not verified: a silently failed paint keeps a stale id until content changes
+ * or a button press forces a repaint. */
+extern char last_content_id[16];
 
 /* Canonical next-refresh schedule anchor:
  *   0        → not scheduled; always due (first boot, no server contact yet)
