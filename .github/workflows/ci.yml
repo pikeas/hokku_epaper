@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, franken-2026-08-05]
   pull_request:
 
 jobs:
